@@ -106,6 +106,10 @@ def binding_columns(keys):
     for col,groups in enumerate(BINDING_COLUMNS):
         for title,known in groups:
             fields=[(key,label) for key,label in known if key in remaining]
+            if title=='Targeting':
+                existing={key for key,_ in fields}
+                added=[(key,binding_label(key)) for key in sorted(remaining) if key.startswith('target_') and key not in existing]
+                fields=[item for item in fields if item[0]!='inspect']+added+[item for item in fields if item[0]=='inspect']
             if title=='Action Bar':
                 fields=[(key,binding_label(key)) for key in sorted(remaining,key=lambda k:int(k.split('_')[1]) if re.fullmatch(r'action_\d+',k) else -1) if re.fullmatch(r'action_\d+',key)]
             if fields:
@@ -188,14 +192,14 @@ def atomic_write(path, data):
         if os.path.exists(temporary): os.unlink(temporary)
 
 
-def apply_bindings(path, values, backup_dir, check_game=game_running):
+def apply_bindings(path, values, backup_dir, check_game=game_running, template=None):
     values = validate_for_game(values)
     if check_game(): raise ValueError('Close Arena of Champions before applying a preset.')
     before = path.read_bytes()
     text = before.decode('utf-8-sig')
-    issues = conflicts(text, values)
+    issues = conflicts(text, values,template=template)
     if issues: raise ValueError('Duplicate bindings. Resolve these conflicts before applying:\n\n' + '\n'.join(issues))
-    after = patch_settings(text, values).encode('utf-8')
+    after = patch_settings(text, values,template=template).encode('utf-8')
     if before.startswith(b'\xef\xbb\xbf'): after = b'\xef\xbb\xbf' + after
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
@@ -245,7 +249,8 @@ def read_game_snapshot(path, api=None):
             response = (api or account_api)('GET',None,token)
             remote = response.get('settings') if isinstance(response,dict) else None
             if isinstance(remote,str):
-                snapshot.update(bindings=complete_bindings(read_bindings(remote),bindings),account=remote,source='account')
+                combined=patch_settings(snapshot['document'],read_bindings(remote),template=remote)
+                snapshot.update(document=combined,bindings=validate(read_bindings(combined)),account=remote,source='account')
     except (ValueError,OSError):
         snapshot['notice'] = 'Account settings could not be checked. Loaded the local game settings.'
     if any(not value for value in snapshot['bindings'].values()):
@@ -259,8 +264,6 @@ def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api
     if check_game(): raise ValueError('Close Arena of Champions before applying a preset.')
     before = path.read_bytes()
     local = before.decode('utf-8-sig')
-    issues = conflicts(local, values)
-    if issues: raise ValueError('Duplicate bindings:\n\n' + '\n'.join(issues))
     token = session_token(path)
     if not token:
         raise ValueError('No game session found. Sign in to the game, close it, then apply again.')
@@ -268,9 +271,12 @@ def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api
     remote = response.get('settings') if isinstance(response, dict) else None
     if not isinstance(remote, str):
         raise ValueError('No saved account settings found. Change a setting in the game, close it, then apply again.')
-    issues = conflicts(remote, values,template=local)
+    combined=patch_settings(local,read_bindings(remote),template=remote)
+    issues=conflicts(local,values,template=combined)
+    if issues:raise ValueError('Duplicate bindings:\n\n'+'\n'.join(issues))
+    issues = conflicts(remote, values,template=combined)
     if issues: raise ValueError('These bindings conflict with your account settings:\n\n' + '\n'.join(issues))
-    updated = patch_settings(remote, values,template=local)
+    updated = patch_settings(remote, values,template=combined)
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     atomic_write(backup_dir / (stamp + '-account-settings.json'), json.dumps({'settings': remote}, indent=2).encode())
@@ -289,7 +295,7 @@ def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api
         raise ValueError('The account update was sent, but could not be verified. The local file was not changed. Try applying again.') from None
     try:
         if path.read_bytes() != before: raise ValueError('The local settings changed during synchronization.')
-        backup = apply_bindings(path, values, backup_dir, check_game)
+        backup = apply_bindings(path, values, backup_dir, check_game,template=combined)
     except Exception as exc:
         raise ValueError(f'Account bindings were updated, but the local file could not be updated: {exc}') from None
     if not bindings_match(path.read_bytes().decode('utf-8-sig'),values):
@@ -580,7 +586,7 @@ class App:
             else:
                 self.name.set('')
                 self.highlight_selection()
-            self.status.set(snapshot['notice'] or ('Your presets now include all game bindings.' if upgrading else 'Current bindings saved for all nine classes.' if initialise else 'Current '+snapshot['source']+' bindings loaded.'))
+            self.status.set(snapshot['notice'] or ('Your presets now include all game bindings.' if upgrading else 'Current bindings saved for all nine classes.' if initialise else f"{len(snapshot['bindings'])} current {snapshot['source']} bindings loaded."))
         if not any((path.parent/name).exists() for name in ('session.ron','guest.ron')):
             loaded(read_game_snapshot(path))
             return
@@ -677,7 +683,7 @@ class App:
     def start_apply(self, values, restoring=False, game=None, approved=False):
         self.cancel_capture()
         values = validate_for_game(values)
-        issues = conflicts(self.settings_path().read_bytes().decode('utf-8-sig'),values)
+        issues = conflicts(self.settings_path().read_bytes().decode('utf-8-sig'),values,template=self.document)
         if issues: raise ValueError('Clear or change duplicate bindings before applying:\n\n'+'\n'.join(issues))
         if not approved:
             game = running_game()
@@ -711,7 +717,8 @@ class App:
         path = filedialog.askopenfilename(parent=self.root,title='Restore bindings from a backup', initialdir=self.data / 'backups', filetypes=[('RON backup', '*.ron')])
         if not path: return
         values = read_bindings(user_path(path).read_bytes().decode('utf-8-sig'))
-        baseline=read_bindings(self.settings_path().read_bytes().decode('utf-8-sig'))
+        schema=getattr(self,'schema',None)
+        baseline=schema.values() if schema else read_bindings(self.settings_path().read_bytes().decode('utf-8-sig'))
         self.start_apply(complete_bindings(values,baseline), restoring=True)
     def import_preset(self):
         path = filedialog.askopenfilename(parent=self.root,filetypes=[('Preset JSON', '*.json')])

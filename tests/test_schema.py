@@ -112,5 +112,34 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(len(snapshot['bindings']),35)
             self.assertEqual(snapshot['bindings']['action_10'],'F16')
 
+    def test_local_cache_does_not_hide_new_bindings_from_the_account(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder=Path(temp);path=folder/'settings.ron';path.write_text(self.text)
+            (folder/'session.ron').write_text('(token: "fake")')
+            remote=extended(self.text)
+            snapshot=presets.read_game_snapshot(path,lambda *args:{'settings':remote})
+            self.assertEqual(len(snapshot['bindings']),35)
+            self.assertEqual(len(Schema(snapshot['document']).bindings),35)
+            self.assertEqual(path.read_text(),self.text)
+
+    def test_new_account_bindings_can_be_applied_to_an_older_local_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder=Path(temp);path=folder/'settings.ron';path.write_text(self.text)
+            (folder/'session.ron').write_text('(token: "fake")')
+            state={'settings':extended(self.text)}
+            def api(method,payload,token):
+                if method=='PUT':state.update(payload);return {}
+                return dict(state)
+            values=presets.read_bindings(state['settings']);values['interrupt_focus']='Ctrl-KeyC'
+            presets.apply_synced_bindings(path,values,folder/'backups',lambda:False,api)
+            self.assertEqual(presets.read_bindings(path.read_text()),values)
+            self.assertEqual(presets.read_bindings(state['settings']),values)
+
+    def test_unknown_target_actions_appear_in_targeting_without_fixed_count(self):
+        values=presets.read_bindings(self.text)
+        values.update({f'target_enemy_{i}':f'Shift-F{i}' for i in range(1,5)})
+        groups={name:dict(fields) for column in presets.binding_columns(list(values)) for name,fields in column}
+        self.assertEqual(groups['Targeting']['target_enemy_4'],'Target enemy 4')
+
 
 if __name__=='__main__':unittest.main(verbosity=2)
