@@ -1,0 +1,709 @@
+"""Portable AoC keybinding preset manager. Standard library only."""
+from __future__ import annotations
+
+import csv
+import ctypes
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import queue
+import urllib.request
+import urllib.error
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from restart_game import running_game, apply_with_restart
+from wc3_theme import install as install_wc3_theme
+
+BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
+DEFAULT_SETTINGS = Path(os.environ.get('APPDATA', str(Path.home()))) / 'arena-of-champions' / 'settings.ron'
+RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+CLASSES = ['Warrior', 'Mage', 'Priest', 'Rogue', 'Hunter', 'Paladin', 'Warlock', 'Druid', 'Shaman']
+FIELDS = [(f'action_{i+1}', f'Action {i+1}') for i in range(8)] + [
+    ('stealth', 'Class ability 1'), ('class_2', 'Class ability 2'),
+    ('class_3', 'Class ability 3'), ('trinket', 'Utility 1'), ('utility_2', 'Utility 2')]
+SINGLE = [key for key, _ in FIELDS[8:]]
+TOKEN = r'"([^"\\\r\n]*)"'
+
+
+def key_section(text):
+    """Locate keys independently of the surrounding settings structure."""
+    matches = list(re.finditer(r'\bkeys\s*:\s*\(', text))
+    if len(matches) != 1:
+        raise ValueError('The keys section is not recognized. No changes were made.')
+    start = matches[0].end()
+    # Current keys schema contains a tuple for hotbar, strings and no comments.
+    depth, quoted, escaped = 1, False, False
+    for pos in range(start, len(text)):
+        c = text[pos]
+        if quoted:
+            if escaped: escaped = False
+            elif c == '\\': escaped = True
+            elif c == '"': quoted = False
+        elif c == '"': quoted = True
+        elif c == '(': depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0: return start, pos
+    raise ValueError('The keys section is incomplete.')
+
+
+def binding_spans(text):
+    start, end = key_section(text)
+    section = text[start:end]
+    result = {}
+    hotbar = list(re.finditer(r'\bhotbar\s*:\s*\(([^()]*)\)', section))
+    if len(hotbar) != 1: raise ValueError('The Action Bar format is not recognized.')
+    tokens = list(re.finditer(TOKEN, hotbar[0].group(1)))
+    if len(tokens) != 8 or re.sub(TOKEN, '', hotbar[0].group(1)).strip(' \t\r\n,'):
+        raise ValueError('Expected exactly 8 Action Bar bindings.')
+    for i, token in enumerate(tokens):
+        offset = start + hotbar[0].start(1)
+        result[f'action_{i+1}'] = (offset + token.start(1), offset + token.end(1))
+    for key in SINGLE:
+        hits = list(re.finditer(r'\b' + key + r'\s*:\s*' + TOKEN, section))
+        if len(hits) != 1: raise ValueError(f'The binding {key} is not recognized.')
+        result[key] = (start + hits[0].start(1), start + hits[0].end(1))
+    return result
+
+
+def read_bindings(text):
+    return {key: text[a:b] for key, (a, b) in binding_spans(text).items()}
+
+
+def canonical(value):
+    if not value.strip(): return ''
+    parts = value.strip().split('-')
+    modifiers = parts[:-1]
+    if len(set(modifiers)) != len(modifiers) or any(x not in ('Ctrl', 'Alt', 'Shift') for x in modifiers):
+        raise ValueError(f'Invalid combination: {value}')
+    key = parts[-1]
+    if not re.fullmatch(r'(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-9]|2[0-4])|Space|Tab|CapsLock|Enter|Escape|Backspace|Delete|Insert|Home|End|PageUp|PageDown|Arrow(?:Up|Down|Left|Right)|Backquote|Minus|Equal|BracketLeft|BracketRight|Backslash|Semicolon|Quote|Comma|Period|Slash|Mouse(?:Left|Right|Middle|[45]|WheelUp|WheelDown)|Numpad(?:[0-9]|Add|Subtract|Multiply|Divide|Decimal|Enter))', key):
+        raise ValueError(f'Unknown key: {value}\nClick a binding field to capture a valid key or mouse button.')
+    return '-'.join([m for m in ('Ctrl', 'Alt', 'Shift') if m in modifiers] + [key])
+
+
+def validate(values):
+    if not isinstance(values, dict) or set(values) != {k for k, _ in FIELDS}:
+        raise ValueError('The preset must contain exactly 13 bindings.')
+    if not all(isinstance(v, str) for v in values.values()): raise ValueError('Bindings must be strings.')
+    return {k: canonical(v) for k, v in values.items()}
+
+
+def patch_settings(text, values):
+    values = validate(values)
+    spans = binding_spans(text)
+    for key, (a, b) in sorted(spans.items(), key=lambda item: item[1][0], reverse=True):
+        text = text[:a] + values[key] + text[b:]
+    return text
+
+
+def conflicts(text, values):
+    updated = patch_settings(text, values)
+    start, end = key_section(updated)
+    section = updated[start:end]
+    labels = dict(FIELDS)
+    bindings = [(labels[k], v, True) for k, v in values.items()]
+    for m in re.finditer(r'\b(\w+)\s*:\s*' + TOKEN, section):
+        if m.group(1) not in SINGLE:
+            bindings.append((m.group(1), m.group(2), False))
+    issues = []
+    for i, (label, value, edited) in enumerate(bindings):
+        for other_label, other_value, other_edited in bindings[:i]:
+            if value and value == other_value and (edited or other_edited):
+                issues.append(f'{label} and {other_label}: {value}')
+    return issues
+
+
+def game_running():
+    result = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'], capture_output=True,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=10)
+    if result.returncode: raise RuntimeError('Could not check whether the game is running.')
+    rows = csv.reader(result.stdout.decode('utf-8', errors='replace').splitlines())
+    return any(row and (row[0].lower() in ('arenaofchampions.exe', 'aoc-client.exe', 'aoc_client.exe')
+                       or row[0].lower().startswith('arenaofchampions')) for row in rows)
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+
+def apply_bindings(path, values, backup_dir, check_game=game_running):
+    if check_game(): raise ValueError('Close Arena of Champions before applying a preset.')
+    before = path.read_bytes()
+    text = before.decode('utf-8-sig')
+    issues = conflicts(text, values)
+    if issues: raise ValueError('Duplicate bindings. Resolve these conflicts before applying:\n\n' + '\n'.join(issues))
+    after = patch_settings(text, values).encode('utf-8')
+    if before.startswith(b'\xef\xbb\xbf'): after = b'\xef\xbb\xbf' + after
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    backup = backup_dir / (stamp + '-settings.ron')
+    atomic_write(backup, before)
+    if path.read_bytes() != before: raise ValueError('The settings file changed during the operation. Please try again.')
+    if check_game(): raise ValueError('The game has started. Close it before applying.')
+    atomic_write(path, after)
+    return backup
+
+
+def account_api(method, payload, token):
+    request = urllib.request.Request(
+        'https://arenaofchampions.live/api/settings',
+        data=json.dumps(payload).encode('utf-8') if payload is not None else None,
+        headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json',
+                 'Content-Type': 'application/json'}, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read(2_000_000)
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise ValueError('Your game session has expired. Sign in to the game, close it, then apply again.') from None
+        raise ValueError(f'The game server rejected the settings request (HTTP {exc.code}).') from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise ValueError('Could not reach the game server. Check your connection and try again.') from None
+
+
+def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api=account_api):
+    """Patch only our bindings in both existing documents, keeping tokens in memory."""
+    values = validate(values)
+    if check_game(): raise ValueError('Close Arena of Champions before applying a preset.')
+    before = path.read_bytes()
+    local = before.decode('utf-8-sig')
+    issues = conflicts(local, values)
+    if issues: raise ValueError('Duplicate bindings:\n\n' + '\n'.join(issues))
+    session_path = path.parent / 'session.ron'
+    if not session_path.exists(): session_path = path.parent / 'guest.ron'
+    if not session_path.exists():
+        raise ValueError('No game session found. Sign in to the game, close it, then apply again.')
+    session = session_path.read_text(encoding='utf-8-sig')
+    match = re.search(r'\btoken\s*:\s*"([^"\r\n]+)"', session)
+    if not match: raise ValueError('The saved game session is not recognized. Sign in to the game again.')
+    token = match.group(1)
+    response = api('GET', None, token)
+    remote = response.get('settings') if isinstance(response, dict) else None
+    if not isinstance(remote, str):
+        raise ValueError('No saved account settings found. Change a setting in the game, close it, then apply again.')
+    issues = conflicts(remote, values)
+    if issues: raise ValueError('These bindings conflict with your account settings:\n\n' + '\n'.join(issues))
+    updated = patch_settings(remote, values)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    atomic_write(backup_dir / (stamp + '-account-settings.json'), json.dumps({'settings': remote}, indent=2).encode())
+    # Keep a local backup before the remote operation as well, even if the
+    # subsequent local write fails or the server cannot confirm the change.
+    atomic_write(backup_dir / (stamp + '-settings.ron'), before)
+    if check_game(): raise ValueError('The game has started. Close it before applying.')
+    if path.read_bytes() != before: raise ValueError('The local settings changed. Please try again.')
+    api('PUT', {'settings': updated}, token)
+    try:
+        verified = api('GET', None, token)
+        saved = verified.get('settings') if isinstance(verified, dict) else None
+        if not isinstance(saved, str) or read_bindings(saved) != values:
+            raise ValueError('The server returned different bindings.')
+    except Exception:
+        raise ValueError('The account update was sent, but could not be verified. The local file was not changed. Try applying again.') from None
+    try:
+        if path.read_bytes() != before: raise ValueError('The local settings changed during synchronization.')
+        backup = apply_bindings(path, values, backup_dir, check_game)
+    except Exception as exc:
+        raise ValueError(f'Account bindings were updated, but the local file could not be updated: {exc}') from None
+    if read_bindings(path.read_bytes().decode('utf-8-sig')) != values:
+        raise ValueError('The account was updated, but local verification failed. Close the game and apply again.')
+    return backup
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.data = BASE / 'data'
+        self.store_path = self.data / 'presets.json'
+        self.store = {'version': 1, 'settings_path': str(DEFAULT_SETTINGS), 'presets': {}}
+        if self.store_path.exists():
+            saved = json.loads(self.store_path.read_text(encoding='utf-8'))
+            self.store = {key: saved[key] for key in ('version', 'settings_path', 'presets', 'binding_priorities') if key in saved}
+            if self.store.get('version') != 1: raise ValueError('Unsupported presets version.')
+        self.path = tk.StringVar(value=self.store.get('settings_path', str(DEFAULT_SETTINGS)))
+        self.name = tk.StringVar()
+        self.values = {key: tk.StringVar() for key, _ in FIELDS}
+        self.displays = {key: tk.StringVar() for key, _ in FIELDS}
+        self.binding_entries = {}
+        self.binding_labels = {}
+        self.binding_frames = {}
+        self.clear_buttons = {}
+        self.edit_order = {key: 0 for key, _ in FIELDS}
+        self.edit_counter = 0
+        self.loading_bindings = False
+        self.conflict_fields = set()
+        self.capture_state = None
+        self.busy = False
+        self.restart_dialog = None
+        for key, value in self.values.items():
+            value.trace_add('write', lambda *args, k=key: self.sync_display(k))
+        self.status = tk.StringVar(value='Select a preset.')
+        self.selected_label = tk.StringVar(value='Current bindings')
+        self.store.setdefault('binding_priorities', {})
+        self.icons = {name: tk.PhotoImage(file=str(RESOURCES / 'icons' / (name.lower() + '.png'))).zoom(3, 3).subsample(4, 4) for name in CLASSES}
+        self.preset_buttons = {}
+        root.title('AoC-bind-presets')
+        root.iconbitmap(default=str(RESOURCES / 'icons' / 'app.ico'))
+        root.geometry('1120x810')
+        root.minsize(1080,780)
+        install_wc3_theme(root,RESOURCES)
+        outer = ttk.Frame(root,style='Window.TFrame',padding=(34,30,34,28))
+        outer.pack(fill='both',expand=True)
+        ttk.Label(outer,text='AoC-bind-presets',style='Title.TLabel',anchor='center').pack(fill='x',pady=(0,14))
+        location = ttk.Frame(outer); location.pack(fill='x')
+        ttk.Entry(location, textvariable=self.path).pack(side='left', fill='x', expand=True)
+        ttk.Button(location, text='Browse settings.ron', command=lambda: self.safe(self.browse)).pack(side='left', padx=(8, 0))
+        body = ttk.Frame(outer); body.pack(fill='both', expand=True, pady=(18, 0))
+        sidebar = ttk.Frame(body); sidebar.pack(side='left', fill='y', padx=(0, 20))
+        self.preset_canvas = tk.Canvas(sidebar, width=76, background='#0d1217', highlightthickness=0)
+        self.preset_canvas.pack(side='left', fill='y')
+        scrollbar = ttk.Scrollbar(sidebar, orient='vertical', command=self.preset_canvas.yview)
+        scrollbar.pack(side='right', fill='y')
+        self.preset_canvas.configure(yscrollcommand=scrollbar.set)
+        self.preset_list = ttk.Frame(self.preset_canvas)
+        self.preset_canvas.create_window((0, 0), window=self.preset_list, anchor='nw', width=76)
+        self.preset_list.bind('<Configure>', lambda e: self.preset_canvas.configure(scrollregion=self.preset_canvas.bbox('all')))
+        self.preset_canvas.bind('<MouseWheel>', lambda e: self.preset_canvas.yview_scroll(-int(e.delta / 120), 'units'))
+        content = ttk.Frame(body); content.pack(side='left', fill='both', expand=True)
+        presets = ttk.Frame(content); presets.pack(fill='x', pady=(0, 18))
+        ttk.Label(presets, textvariable=self.selected_label, style='Heading.TLabel').pack(side='left', fill='x', expand=True)
+        for label, command in [('Save to…', self.save_as), ('Save', self.update), ('Reset', self.delete)]:
+            ttk.Button(presets, text=label, command=lambda f=command: self.safe(f)).pack(side='left', padx=(8, 0))
+        columns = ttk.Frame(content); columns.pack(fill='both', expand=True)
+        for col, title, fields in [(0, 'Action Bar', FIELDS[:8]), (1, 'Beside the Bar', FIELDS[8:])]:
+            box = ttk.Frame(columns, padding=(0 if col == 0 else 26, 0, 16, 0))
+            box.grid(row=0, column=col, sticky='nsew')
+            columns.columnconfigure(col, weight=1)
+            heading = ttk.Frame(box)
+            heading.grid(row=0,column=0,columnspan=2,sticky='ew',pady=(0,8))
+            ttk.Label(heading,text=title,style='Heading.TLabel').pack(anchor='w')
+            ttk.Separator(heading,orient='horizontal').pack(fill='x',pady=(5,0))
+            for row, (key, label) in enumerate(fields, 1):
+                name_label = ttk.Label(box, text=label, cursor='hand2')
+                name_label.grid(row=row, column=0, sticky='w', padx=(0, 10), pady=9)
+                field = tk.Frame(box,bg='#211c13',highlightbackground='#8e7135',highlightthickness=1)
+                field.grid(row=row, column=1, sticky='ew', pady=9)
+                entry = ttk.Entry(field, textvariable=self.displays[key], width=24, state='readonly', cursor='hand2', style='Binding.TEntry',font=('Georgia',10,'bold'))
+                entry.pack(side='left',fill='x',expand=True)
+                clear = tk.Canvas(field,width=26,height=24,bg='#211c13',highlightthickness=0,cursor='hand2',takefocus=True)
+                clear.pack(side='right',padx=(1,3))
+                clear.create_line(7,8,19,8,fill='#b8a780',width=1.5,tags='bin')
+                clear.create_line(10,7,10,5,16,5,16,7,fill='#b8a780',width=1.5,tags='bin')
+                clear.create_line(8,10,9,20,17,20,18,10,fill='#b8a780',width=1.5,tags='bin')
+                clear.create_line(11,11,11,17,fill='#b8a780',width=1,tags='bin')
+                clear.create_line(15,11,15,17,fill='#b8a780',width=1,tags='bin')
+                self.add_tooltip(clear,'Clear binding')
+                clear.bind('<ButtonPress-1>',lambda event,k=key: self.clear_binding(k),add='+')
+                clear.bind('<Return>',lambda event,k=key: self.clear_binding(k))
+                clear.bind('<space>',lambda event,k=key: self.clear_binding(k))
+                self.binding_frames[key] = field
+                self.clear_buttons[key] = clear
+                self.binding_labels[key] = name_label
+                self.binding_entries[key] = entry
+                for widget in (name_label, entry):
+                    widget.bind('<ButtonPress-1>', lambda event, k=key: self.capture(k))
+                entry.bind('<Return>', lambda event, k=key: self.capture(k))
+            box.columnconfigure(1, weight=1)
+        ttk.Label(outer, textvariable=self.status, wraplength=850, foreground='#b8a780').pack(anchor='w', pady=(6, 12))
+        bottom = ttk.Frame(outer); bottom.pack(fill='x')
+        for label, command in [('Read from game', self.read_current), ('Restore bindings…', self.restore), ('Import', self.import_preset), ('Export', self.export_preset)]:
+            ttk.Button(bottom, text=label, command=lambda f=command: self.safe(f)).pack(side='left', padx=(0, 6))
+        ttk.Button(bottom, text='Apply preset', command=lambda: self.safe(self.apply)).pack(side='right')
+        if self.settings_path().exists():
+            self.read_current()
+            if not self.store['presets']:
+                self.store['presets']['Original'] = self.form_values()
+            for class_name in CLASSES:
+                if class_name not in self.store['presets']:
+                    self.store['presets'][class_name] = self.form_values()
+            self.persist()
+            if self.store['presets']:
+                self.name.set('Warrior' if 'Warrior' in self.store['presets'] else next(iter(self.store['presets'])))
+                self.load()
+        self.refresh()
+        root.bind('<FocusOut>', self.capture_focus_out, add='+')
+        root.bind('<Destroy>', lambda event: self.cancel_capture() if event.widget == root else None, add='+')
+        root.protocol('WM_DELETE_WINDOW', self.close_manager)
+
+    def close_manager(self):
+        if self.busy:
+            self.status.set('Please wait until the current operation finishes.')
+            return
+        self.root.destroy()
+
+    def safe(self, function):
+        if self.busy: return
+        try: function()
+        except Exception as exc: messagebox.showerror('Could not complete the operation', str(exc), parent=self.root)
+
+    def settings_path(self): return Path(self.path.get().strip())
+    def form_values(self): return validate({k: var.get() for k, var in self.values.items()})
+    def fill(self, values, priorities=None):
+        self.cancel_capture()
+        values = validate(values)
+        self.loading_bindings = True
+        try:
+            priorities = priorities if isinstance(priorities,dict) else {}
+            self.edit_order = {key: priorities[key] if isinstance(priorities.get(key),int) and priorities[key]>0 else 0 for key in self.values}
+            self.edit_counter = max(self.edit_order.values())
+            for key, value in values.items(): self.values[key].set(value)
+        finally: self.loading_bindings = False
+        self.refresh_conflicts()
+    def refresh(self):
+        for child in self.preset_list.winfo_children(): child.destroy()
+        self.preset_buttons.clear()
+        names = CLASSES
+        for name in names:
+            button = tk.Button(self.preset_list, image=self.icons[name],
+                               bg='#211c13', activebackground='#3b3019', relief='flat',
+                               borderwidth=0, highlightthickness=2, highlightbackground='#8e7135',
+                               highlightcolor='#ffd100', cursor='hand2', takefocus=True,
+                               command=lambda n=name: self.safe(lambda: self.select(n)))
+            button.pack(padx=5, pady=3, ipadx=3, ipady=2)
+            button.bind('<MouseWheel>', lambda e: self.preset_canvas.yview_scroll(-int(e.delta / 120), 'units'))
+            self.add_tooltip(button, name)
+            self.preset_buttons[name] = button
+        self.highlight_selection()
+
+    def highlight_selection(self):
+        for name, button in self.preset_buttons.items():
+            selected = name == self.name.get()
+            button.configure(bg='#493a17' if selected else '#211c13',
+                             highlightbackground='#ffd100' if selected else '#8e7135')
+        self.selected_label.set(self.name.get() or 'Current bindings')
+
+    def select(self, name):
+        if name not in self.store['presets']:
+            self.store['presets'][name] = self.form_values()
+        self.name.set(name)
+        self.load()
+
+    def add_tooltip(self, widget, text):
+        tooltip = None
+        pending = None
+        def hide(event=None):
+            nonlocal tooltip, pending
+            if pending: self.root.after_cancel(pending); pending = None
+            if tooltip: tooltip.destroy(); tooltip = None
+        def show():
+            nonlocal tooltip, pending
+            pending = None
+            tooltip = tk.Toplevel(self.root); tooltip.overrideredirect(True)
+            tooltip.geometry(f'+{widget.winfo_rootx() + widget.winfo_width() + 8}+{widget.winfo_rooty() + 10}')
+            tk.Label(tooltip, text=text, bg='#241f16', fg='#e9e3d3', padx=10, pady=6, font=('Georgia', 10)).pack()
+        def schedule(event=None):
+            nonlocal pending
+            hide(); pending = self.root.after(350, show)
+        widget.bind('<Enter>', schedule)
+        widget.bind('<Leave>', hide)
+        widget.bind('<ButtonPress-1>', hide)
+        widget.bind('<Destroy>', hide)
+    def persist(self):
+        self.store['settings_path'] = self.path.get()
+        atomic_write(self.store_path, json.dumps(self.store, indent=2, ensure_ascii=False).encode('utf-8'))
+    def browse(self):
+        path = filedialog.askopenfilename(title='Select settings.ron', filetypes=[('RON settings', '*.ron')])
+        if path: self.path.set(path); self.read_current()
+    def read_current(self):
+        self.fill(read_bindings(self.settings_path().read_bytes().decode('utf-8-sig')))
+        self.name.set('')
+        self.highlight_selection()
+        self.status.set('Current bindings loaded.')
+    def load(self):
+        self.fill(self.store['presets'][self.name.get()],self.store['binding_priorities'].get(self.name.get()))
+        self.highlight_selection()
+        self.status.set('')
+    def save_as(self):
+        values = self.form_values()
+        dialog = tk.Toplevel(self.root); dialog.title('Save to class'); dialog.transient(self.root)
+        dialog.configure(bg='#0d1217'); dialog.resizable(False, False)
+        panel = ttk.Frame(dialog, padding=22); panel.pack()
+        name_var = tk.StringVar(value=self.name.get() if self.name.get() in CLASSES else 'Warrior')
+        ttk.Label(panel, text='Class').grid(row=0, column=0, sticky='w', pady=8, padx=(0, 15))
+        entry = ttk.Combobox(panel, textvariable=name_var, values=CLASSES, state='readonly', width=26)
+        entry.grid(row=0, column=1)
+        def save():
+            name = name_var.get().strip()
+            if name not in CLASSES: return
+            if name in self.store['presets'] and not messagebox.askyesno('Replace preset', f'Replace "{name}"?', parent=dialog): return
+            self.store['presets'][name] = values
+            self.store['binding_priorities'][name] = dict(self.edit_order)
+            self.name.set(name); self.persist(); self.refresh()
+            self.status.set(f'"{name}" saved.'); dialog.destroy()
+        ttk.Button(panel, text='Cancel', command=dialog.destroy).grid(row=2, column=0, pady=(16, 0))
+        ttk.Button(panel, text='Save', command=lambda: self.safe(save)).grid(row=2, column=1, sticky='e', pady=(16, 0))
+        dialog.grab_set(); entry.focus_set()
+    def update(self):
+        name = self.name.get()
+        if not name: return self.save_as()
+        self.store['presets'][name] = self.form_values()
+        self.store['binding_priorities'][name] = dict(self.edit_order)
+        self.persist()
+        self.status.set(f'Preset "{name}" saved.')
+    def delete(self):
+        name = self.name.get()
+        if name in CLASSES and messagebox.askyesno('Reset preset', f'Reset "{name}" to the original bindings?', parent=self.root):
+            original = self.store['presets'].get('Original')
+            if original is None:
+                original = read_bindings(self.settings_path().read_bytes().decode('utf-8-sig'))
+            self.store['presets'][name] = dict(validate(original))
+            self.store['binding_priorities'].pop(name,None)
+            self.persist(); self.load()
+            self.status.set(f'"{name}" reset. Apply the preset to update the game.')
+    def apply(self):
+        self.start_apply(self.form_values())
+
+    def confirm_restart(self, values, restoring, game):
+        if self.restart_dialog is not None and self.restart_dialog.winfo_exists():
+            self.restart_dialog.focus_force(); return
+        dialog = tk.Toplevel(self.root)
+        self.restart_dialog = dialog
+        dialog.title('Restart Arena of Champions?')
+        dialog.transient(self.root); dialog.resizable(False,False)
+        panel = ttk.Frame(dialog,padding=24); panel.pack(fill='both',expand=True)
+        ttk.Label(panel,text='Arena of Champions is running.',style='Heading.TLabel').pack(anchor='w')
+        ttk.Label(panel,text='Applying this preset will close Arena of Champions, update your bindings, and start the game again. Continue?',wraplength=420).pack(anchor='w',pady=(12,20))
+        buttons = ttk.Frame(panel); buttons.pack(fill='x')
+        def dismiss():
+            self.restart_dialog = None
+            dialog.destroy()
+        def cancel():
+            dismiss(); self.status.set('Restart cancelled.')
+        def accept():
+            dismiss()
+            self.safe(lambda: self.start_apply(values,restoring,game,approved=True))
+        cancel_button = ttk.Button(buttons,text='Cancel',command=cancel)
+        cancel_button.pack(side='right')
+        ttk.Button(buttons,text='Restart and apply',command=accept).pack(side='right',padx=(0,8))
+        dialog.protocol('WM_DELETE_WINDOW',cancel)
+        dialog.bind('<Escape>',lambda event: cancel())
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()-dialog.winfo_width())//2
+        y = self.root.winfo_rooty() + (self.root.winfo_height()-dialog.winfo_height())//2
+        dialog.geometry(f'+{max(0,x)}+{max(0,y)}')
+        dialog.grab_set(); cancel_button.focus_set()
+
+    def start_apply(self, values, restoring=False, game=None, approved=False):
+        self.cancel_capture()
+        values = validate(values)
+        issues = conflicts(self.settings_path().read_bytes().decode('utf-8-sig'),values)
+        if issues: raise ValueError('Clear or change duplicate bindings before applying:\n\n'+'\n'.join(issues))
+        if not approved:
+            game = running_game()
+            if game is not None:
+                self.confirm_restart(values,restoring,game)
+                return
+        path = self.settings_path()
+        self.busy = True
+        self.status.set('Restarting the game and applying bindings…' if game else 'Updating account and local bindings…')
+        results = queue.SimpleQueue()
+        def worker():
+            try: results.put((True, apply_with_restart(path,values,self.data/'backups',game,apply_synced_bindings)))
+            except Exception as exc: results.put((False, str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+        def poll():
+            try: success, result = results.get_nowait()
+            except queue.Empty:
+                self.root.after(80, poll); return
+            self.busy = False
+            if not success:
+                self.status.set('Bindings were not fully applied.')
+                messagebox.showerror('Could not apply preset', result, parent=self.root)
+                return
+            if restoring: self.fill(values)
+            self.persist()
+            backup,restarted = result
+            self.status.set('Bindings verified. Arena of Champions was restarted.' if restarted else 'Verified: account and local bindings match. You can now start the game.')
+            messagebox.showinfo('Bindings applied', 'Account and local bindings were updated and verified.\n' + ('Arena of Champions was restarted.' if restarted else 'You can now start the game.'), parent=self.root)
+        self.root.after(80, poll)
+    def restore(self):
+        path = filedialog.askopenfilename(title='Restore bindings from a backup', initialdir=self.data / 'backups', filetypes=[('RON backup', '*.ron')])
+        if not path: return
+        values = read_bindings(Path(path).read_bytes().decode('utf-8-sig'))
+        self.start_apply(validate(values), restoring=True)
+    def import_preset(self):
+        path = filedialog.askopenfilename(filetypes=[('Preset JSON', '*.json')])
+        if not path: return
+        payload = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        self.fill(payload['bindings'])
+        self.name.set('')
+        self.highlight_selection()
+        self.status.set('Preset imported. Use Save to to choose its class.')
+    def export_preset(self):
+        values = self.form_values()
+        path = filedialog.asksaveasfilename(defaultextension='.json', initialfile=(self.name.get() or 'preset') + '.json', filetypes=[('Preset JSON', '*.json')])
+        if path: atomic_write(Path(path), json.dumps({'name': self.name.get(), 'bindings': values}, indent=2, ensure_ascii=False).encode('utf-8'))
+
+    def sync_display(self, key):
+        if not self.capture_state or self.capture_state['key'] != key:
+            self.displays[key].set(self.values[key].get())
+        if not self.loading_bindings:
+            self.edit_counter += 1
+            self.edit_order[key] = self.edit_counter
+            self.refresh_conflicts()
+
+    def refresh_conflicts(self):
+        groups = {}
+        for key,value in self.values.items():
+            binding = value.get()
+            if binding: groups.setdefault(binding,[]).append(key)
+        red = set()
+        for keys in groups.values():
+            if len(keys)<2: continue
+            newest = max(self.edit_order[key] for key in keys)
+            if not newest: red.update(keys)
+            else: red.update(key for key in keys if self.edit_order[key]<newest)
+        self.conflict_fields = red
+        for key,entry in self.binding_entries.items():
+            listening = self.capture_state and self.capture_state['key']==key
+            background = '#493a17' if listening else '#3b181c' if key in red else '#211c13'
+            entry.configure(style='Listening.TEntry' if listening else 'Conflict.TEntry' if key in red else 'Binding.TEntry')
+            self.binding_labels[key].configure(style='Conflict.TLabel' if key in red else 'TLabel')
+            self.binding_frames[key].configure(bg=background,highlightbackground='#ffd100' if listening else '#d95160' if key in red else '#8e7135')
+            self.clear_buttons[key].configure(bg=background)
+
+    def clear_binding(self,key):
+        if self.busy: return 'break'
+        self.cancel_capture()
+        self.values[key].set('')
+        self.status.set('')
+        return 'break'
+
+    def capture_focus_out(self, event):
+        if self.capture_state:
+            self.root.after_idle(self.cancel_if_unfocused)
+
+    def cancel_if_unfocused(self):
+        if self.capture_state and self.root.focus_get() is None:
+            self.cancel_capture()
+
+    def cancel_capture(self):
+        state = self.capture_state
+        if not state: return
+        self.capture_state = None
+        if state.get('timer'):
+            self.root.after_cancel(state['timer'])
+        for widget, tags in state['widgets']:
+            if widget.winfo_exists(): widget.bindtags(tags)
+        for sequence in ('<KeyPress>', '<ButtonPress>', '<MouseWheel>'):
+            self.root.unbind_class(state['tag'], sequence)
+        key = state['key']
+        self.displays[key].set(self.values[key].get())
+        if self.binding_entries[key].winfo_exists():
+            self.refresh_conflicts()
+
+    def finish_capture(self, base, event=None):
+        if not self.capture_state: return 'break'
+        modifiers = []
+        event_state = getattr(event, 'state', 0)
+        for vk, mask, name in [(0x11, 0x4, 'Ctrl'), (0x12, 0x20000, 'Alt'), (0x10, 0x1, 'Shift')]:
+            down = os.name == 'nt' and ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+            if down or event_state & mask: modifiers.append(name)
+        try: value = canonical('-'.join(modifiers + [base]))
+        except ValueError: return 'break'
+        key = self.capture_state['key']
+        self.cancel_capture()
+        self.values[key].set(value)
+        self.status.set('')
+        return 'break'
+
+    def capture_keypress(self, event):
+        vk = event.keycode
+        if vk == 27:
+            self.cancel_capture()
+            return 'break'
+        if vk in (16, 17, 18, 160, 161, 162, 163, 164, 165): return 'break'
+        keys = {8:'Backspace',9:'Tab',13:'Enter',20:'CapsLock',32:'Space',33:'PageUp',34:'PageDown',35:'End',36:'Home',37:'ArrowLeft',38:'ArrowUp',39:'ArrowRight',40:'ArrowDown',45:'Insert',46:'Delete',106:'NumpadMultiply',107:'NumpadAdd',109:'NumpadSubtract',110:'NumpadDecimal',111:'NumpadDivide',186:'Semicolon',187:'Equal',188:'Comma',189:'Minus',190:'Period',191:'Slash',192:'Backquote',219:'BracketLeft',220:'Backslash',221:'BracketRight',222:'Quote'}
+        if 65 <= vk <= 90: base = 'Key' + chr(vk)
+        elif 48 <= vk <= 57: base = 'Digit' + chr(vk)
+        elif 112 <= vk <= 135: base = 'F' + str(vk-111)
+        elif 96 <= vk <= 105: base = 'Numpad' + str(vk-96)
+        else: base = keys.get(vk)
+        if base: self.finish_capture(base, event)
+        return 'break'
+
+    def capture(self, key):
+        if self.busy: return 'break'
+        self.cancel_capture()
+        tag = 'AoCInlineCapture' + str(id(self))
+        state = {'key': key, 'tag': tag, 'widgets': [], 'timer': None}
+        self.capture_state = state
+        self.displays[key].set('Press a key or button')
+        self.binding_entries[key].configure(style='Listening.TEntry')
+        self.refresh_conflicts()
+        self.binding_entries[key].focus_set()
+        # A temporary first bindtag consumes the next input before any button,
+        # entry, scrollbar or shortcut handles it. The opening click has already
+        # reached its widget binding, so it cannot bind itself as MouseLeft.
+        def attach(widget):
+            tags = widget.bindtags()
+            state['widgets'].append((widget, tags))
+            widget.bindtags((tag,) + tags)
+            for child in widget.winfo_children(): attach(child)
+        attach(self.root)
+        self.root.bind_class(tag, '<KeyPress>', self.capture_keypress)
+        def mouse(event):
+            for target,button in self.clear_buttons.items():
+                if event.widget==button: return self.clear_binding(target)
+            base = {1:'MouseLeft',2:'MouseMiddle',3:'MouseRight',4:'Mouse4',5:'Mouse5'}.get(event.num)
+            if base: self.finish_capture(base, event)
+            return 'break'
+        self.root.bind_class(tag, '<ButtonPress>', mouse)
+        self.root.bind_class(tag, '<MouseWheel>', lambda event: self.finish_capture('MouseWheelUp' if event.delta > 0 else 'MouseWheelDown', event))
+        # Tk on Windows does not reliably deliver XBUTTON events. Poll the side
+        # buttons only while this app owns focus and a field is listening.
+        if os.name == 'nt':
+            previous = {vk: bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000) for vk in (5, 6)}
+            def side_buttons():
+                if self.capture_state is not state: return
+                if self.root.focus_get() is None:
+                    self.cancel_capture(); return
+                for vk, base in [(5, 'Mouse4'), (6, 'Mouse5')]:
+                    down = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+                    if down and not previous[vk]: self.finish_capture(base); return
+                    previous[vk] = down
+                state['timer'] = self.root.after(20, side_buttons)
+            state['timer'] = self.root.after(20, side_buttons)
+        return 'break'
+
+
+if __name__ == '__main__':
+    try:
+        if os.name == 'nt':
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('AoC.BindPresets')
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception: pass
+    smoke = len(sys.argv) == 3 and sys.argv[1] == '--smoke-test'
+    scratch = tempfile.TemporaryDirectory() if smoke else None
+    if smoke: BASE = Path(scratch.name)
+    root = tk.Tk()
+    try: app = App(root)
+    except Exception as exc:
+        messagebox.showerror('Startup error', str(exc), parent=root); root.destroy(); sys.exit(1)
+    if smoke:
+        def finish_smoke():
+            result = {'status': 'ok', 'bindings': app.form_values(), 'presets': list(app.store['presets']),
+                      'title': root.title(), 'class_buttons': len(app.preset_buttons),
+                      'window': [root.winfo_width(), root.winfo_height()]}
+            atomic_write(Path(sys.argv[2]), json.dumps(result, indent=2).encode())
+            root.destroy()
+        root.after(500, finish_smoke)
+    root.mainloop()
+    if scratch: scratch.cleanup()
