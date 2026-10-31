@@ -70,7 +70,8 @@ jobs:
             throw 'The executable failed its startup check.'
           }
           $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-          if ($result.status -ne 'ok' -or $result.class_buttons -ne 9 -or -not $result.initialised -or $result.binding_count -ne 29) {
+          $expectedBindings = @($result.bindings.PSObject.Properties).Count
+          if ($result.status -ne 'ok' -or $result.class_buttons -ne 9 -or -not $result.initialised -or $expectedBindings -le 0 -or $result.binding_count -ne $expectedBindings) {
             throw 'The executable returned an unexpected startup result.'
           }
 

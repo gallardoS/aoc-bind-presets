@@ -46,6 +46,7 @@ class PresetTests(unittest.TestCase):
         app=presets.App.__new__(presets.App)
         app.root=Mock()
         app.data=FIXTURE.parent
+        app.path=Mock();app.path.get.return_value=str(FIXTURE)
         app.start_apply=Mock()
         for path in ['"'+str(FIXTURE)+'"','"'+str(FIXTURE), '\\"'+str(FIXTURE)+'\\"',str(FIXTURE)]:
             with patch.object(presets.filedialog,'askopenfilename',return_value=path): app.restore()
@@ -220,7 +221,7 @@ class PresetTests(unittest.TestCase):
                 root=presets.tk.Tk()
                 try:
                     app=presets.App(root);root.update()
-                    self.assertEqual(app.store['version'],2)
+                    self.assertEqual(app.store['version'],3)
                     self.assertEqual(len(app.binding_entries),29)
                     self.assertEqual({key:app.store['presets']['Mage'][key] for key in combat},previous['presets']['Mage'])
                     self.assertEqual(app.store['presets']['Mage']['focus'],'Digit5')

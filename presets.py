@@ -19,11 +19,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from restart_game import running_game, apply_with_restart
 from wc3_theme import install as install_wc3_theme
+from binding_schema import Schema, patch_document, label_for
 
 BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 DEFAULT_SETTINGS = Path(os.environ.get('APPDATA', str(Path.home()))) / 'arena-of-champions' / 'settings.ron'
 RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 CLASSES = ['Warrior', 'Mage', 'Priest', 'Rogue', 'Hunter', 'Paladin', 'Warlock', 'Druid', 'Shaman']
+# These are display labels and category hints, not a required binding schema.
+# Every editable row is discovered from the selected settings file.
 ACTION_FIELDS = [(f'action_{i+1}', f'Action {i+1}') for i in range(8)]
 BESIDE_FIELDS = [
     ('stealth', 'Class ability 1'), ('class_2', 'Class ability 2'),
@@ -86,48 +89,29 @@ def center_dialog(dialog, parent):
 
 
 def key_section(text):
-    """Locate keys independently of the surrounding settings structure."""
-    matches = list(re.finditer(r'\bkeys\s*:\s*\(', text))
-    if len(matches) != 1:
-        raise ValueError('The keys section is not recognized. No changes were made.')
-    start = matches[0].end()
-    # Current keys schema contains a tuple for hotbar, strings and no comments.
-    depth, quoted, escaped = 1, False, False
-    for pos in range(start, len(text)):
-        c = text[pos]
-        if quoted:
-            if escaped: escaped = False
-            elif c == '\\': escaped = True
-            elif c == '"': quoted = False
-        elif c == '"': quoted = True
-        elif c == '(': depth += 1
-        elif c == ')':
-            depth -= 1
-            if depth == 0: return start, pos
-    raise ValueError('The keys section is incomplete.')
-
-
-def binding_spans(text):
-    start, end = key_section(text)
-    section = text[start:end]
-    result = {}
-    hotbar = list(re.finditer(r'\bhotbar\s*:\s*\(([^()]*)\)', section))
-    if len(hotbar) != 1: raise ValueError('The Action Bar format is not recognized.')
-    tokens = list(re.finditer(TOKEN, hotbar[0].group(1)))
-    if len(tokens) != 8 or re.sub(TOKEN, '', hotbar[0].group(1)).strip(' \t\r\n,'):
-        raise ValueError('Expected exactly 8 Action Bar bindings.')
-    for i, token in enumerate(tokens):
-        offset = start + hotbar[0].start(1)
-        result[f'action_{i+1}'] = (offset + token.start(1), offset + token.end(1))
-    for key in SINGLE:
-        hits = list(re.finditer(r'\b' + key + r'\s*:\s*' + TOKEN, section))
-        if len(hits) != 1: raise ValueError(f'The binding {key} is not recognized.')
-        result[key] = (start + hits[0].start(1), start + hits[0].end(1))
-    return result
+    root=Schema(text).root
+    return root.start+1,root.close
 
 
 def read_bindings(text):
-    return {key: text[a:b] for key, (a, b) in binding_spans(text).items()}
+    return Schema(text).values()
+
+
+def binding_label(key):
+    return dict(FIELDS).get(key,label_for(key))
+
+
+def binding_columns(keys):
+    remaining=set(keys); columns=[[],[]]
+    for col,groups in enumerate(BINDING_COLUMNS):
+        for title,known in groups:
+            fields=[(key,label) for key,label in known if key in remaining]
+            if title=='Action Bar':
+                fields=[(key,binding_label(key)) for key in sorted(remaining,key=lambda k:int(k.split('_')[1]) if re.fullmatch(r'action_\d+',k) else -1) if re.fullmatch(r'action_\d+',key)]
+            if fields:
+                columns[col].append((title,fields));remaining.difference_update(key for key,_ in fields)
+    if remaining:columns[1].append(('Other',[(key,binding_label(key)) for key in keys if key in remaining]))
+    return columns
 
 
 def canonical(value):
@@ -143,48 +127,42 @@ def canonical(value):
 
 
 def validate(values):
-    if not isinstance(values, dict) or set(values) != FIELD_KEYS:
-        raise ValueError(f'The preset must contain exactly {len(FIELDS)} bindings.')
-    if not all(isinstance(v, str) for v in values.values()): raise ValueError('Bindings must be strings.')
-    return {k: canonical(v) for k, v in values.items()}
+    if not isinstance(values,dict) or not values:
+        raise ValueError('Read the game settings before editing a preset.')
+    if any(not isinstance(key,str) or not re.fullmatch(r'[A-Za-z_]\w*(?:(?:\.[A-Za-z_]\w*)|(?:\[\d+\]))*',key) for key in values):
+        raise ValueError('The preset contains an invalid binding name.')
+    if not all(isinstance(value,str) for value in values.values()):raise ValueError('Bindings must be strings.')
+    return {key:canonical(value) for key,value in values.items()}
 
 
-def complete_bindings(values, baseline):
-    if isinstance(values,dict) and set(values)==COMBAT_KEYS:
-        return validate({**validate(baseline),**values})
-    return validate(values)
+def complete_bindings(values,baseline):
+    values=validate(values);baseline=validate(baseline)
+    return {key:values.get(key,value) for key,value in baseline.items()}
 
 
 def validate_for_game(values):
-    values = validate(values)
-    empty = [label for key,label in FIELDS if not values[key]]
-    if empty:
-        raise ValueError('Arena of Champions cannot load empty bindings. Assign a key before applying:\n\n'+'\n'.join(empty))
+    values=validate(values)
+    empty=[binding_label(key) for key,value in values.items() if not value]
+    if empty:raise ValueError('Arena of Champions cannot load empty bindings. Assign a key before applying:\n\n'+'\n'.join(empty))
     return values
 
 
-def patch_settings(text, values):
-    values = validate(values)
-    spans = binding_spans(text)
-    for key, (a, b) in sorted(spans.items(), key=lambda item: item[1][0], reverse=True):
-        text = text[:a] + values[key] + text[b:]
-    return text
+def patch_settings(text,values,template=None):
+    return patch_document(text,validate(values),template)
 
 
-def conflicts(text, values):
-    updated = patch_settings(text, values)
-    start, end = key_section(updated)
-    section = updated[start:end]
-    labels = dict(FIELDS)
-    bindings = [(labels[k], v, True) for k, v in values.items()]
-    for m in re.finditer(r'\b(\w+)\s*:\s*' + TOKEN, section):
-        if m.group(1) not in SINGLE:
-            bindings.append((m.group(1), m.group(2), False))
-    issues = []
-    for i, (label, value, edited) in enumerate(bindings):
-        for other_label, other_value, other_edited in bindings[:i]:
-            if value and value == other_value and (edited or other_edited):
-                issues.append(f'{label} and {other_label}: {value}')
+def bindings_match(text,values):
+    actual=read_bindings(text)
+    return all(actual.get(key)==value for key,value in values.items())
+
+
+def conflicts(text,values,template=None):
+    actual=read_bindings(patch_settings(text,values,template))
+    seen={};issues=[]
+    for key,value in actual.items():
+        if not value:continue
+        if value in seen:issues.append(f'{binding_label(seen[value])} and {binding_label(key)}: {value}')
+        else:seen[value]=key
     return issues
 
 
@@ -260,14 +238,14 @@ def session_token(path):
 def read_game_snapshot(path, api=None):
     local = path.read_bytes()
     bindings = validate(read_bindings(local.decode('utf-8-sig')))
-    snapshot = {'local':local,'bindings':bindings,'account':None,'source':'game','notice':''}
+    snapshot = {'local':local,'document':local.decode('utf-8-sig'),'bindings':bindings,'account':None,'source':'game','notice':''}
     try:
         token = session_token(path)
         if token:
             response = (api or account_api)('GET',None,token)
             remote = response.get('settings') if isinstance(response,dict) else None
             if isinstance(remote,str):
-                snapshot.update(bindings=validate(read_bindings(remote)),account=remote,source='account')
+                snapshot.update(bindings=complete_bindings(read_bindings(remote),bindings),account=remote,source='account')
     except (ValueError,OSError):
         snapshot['notice'] = 'Account settings could not be checked. Loaded the local game settings.'
     if any(not value for value in snapshot['bindings'].values()):
@@ -290,9 +268,9 @@ def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api
     remote = response.get('settings') if isinstance(response, dict) else None
     if not isinstance(remote, str):
         raise ValueError('No saved account settings found. Change a setting in the game, close it, then apply again.')
-    issues = conflicts(remote, values)
+    issues = conflicts(remote, values,template=local)
     if issues: raise ValueError('These bindings conflict with your account settings:\n\n' + '\n'.join(issues))
-    updated = patch_settings(remote, values)
+    updated = patch_settings(remote, values,template=local)
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     atomic_write(backup_dir / (stamp + '-account-settings.json'), json.dumps({'settings': remote}, indent=2).encode())
@@ -305,7 +283,7 @@ def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api
     try:
         verified = api('GET', None, token)
         saved = verified.get('settings') if isinstance(verified, dict) else None
-        if not isinstance(saved, str) or read_bindings(saved) != values:
+        if not isinstance(saved, str) or not bindings_match(saved,values):
             raise ValueError('The server returned different bindings.')
     except Exception:
         raise ValueError('The account update was sent, but could not be verified. The local file was not changed. Try applying again.') from None
@@ -314,7 +292,7 @@ def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api
         backup = apply_bindings(path, values, backup_dir, check_game)
     except Exception as exc:
         raise ValueError(f'Account bindings were updated, but the local file could not be updated: {exc}') from None
-    if read_bindings(path.read_bytes().decode('utf-8-sig')) != values:
+    if not bindings_match(path.read_bytes().decode('utf-8-sig'),values):
         raise ValueError('The account was updated, but local verification failed. Close the game and apply again.')
     return backup
 
@@ -324,20 +302,29 @@ class App:
         self.root = root
         self.data = BASE / 'data'
         self.store_path = self.data / 'presets.json'
-        self.store = {'version': 2, 'settings_path': str(DEFAULT_SETTINGS), 'presets': {}}
+        self.store = {'version': 3, 'settings_path': str(DEFAULT_SETTINGS), 'presets': {}}
         if self.store_path.exists():
             saved = json.loads(self.store_path.read_text(encoding='utf-8'))
             self.store = {key: saved[key] for key in ('version', 'settings_path', 'presets', 'binding_priorities') if key in saved}
-            if self.store.get('version') not in (1,2): raise ValueError('Unsupported presets version.')
+            if self.store.get('version') not in (1,2,3): raise ValueError('Unsupported presets version.')
         self.path = tk.StringVar(value=self.store.get('settings_path', str(DEFAULT_SETTINGS)))
+        self.document=None
+        self.schema=None
+        if self.settings_path().exists():
+            try:
+                self.document=self.settings_path().read_bytes().decode('utf-8-sig')
+                self.schema=Schema(self.document)
+            except (OSError,ValueError):self.document=None;self.schema=None
+        self.fields=[(key,binding_label(key)) for key in self.schema.bindings] if self.schema else []
+        self.field_keys={key for key,_ in self.fields}
         self.name = tk.StringVar()
-        self.values = {key: tk.StringVar() for key, _ in FIELDS}
-        self.displays = {key: tk.StringVar() for key, _ in FIELDS}
+        self.values = {key: tk.StringVar() for key, _ in self.fields}
+        self.displays = {key: tk.StringVar() for key, _ in self.fields}
         self.binding_entries = {}
         self.binding_labels = {}
         self.binding_frames = {}
         self.clear_buttons = {}
-        self.edit_order = {key: 0 for key, _ in FIELDS}
+        self.edit_order = {key: 0 for key, _ in self.fields}
         self.edit_counter = 0
         self.loading_bindings = False
         self.conflict_fields = set()
@@ -390,22 +377,7 @@ class App:
         panel_id = self.bindings_canvas.create_window((0,0),window=self.bindings_panel,anchor='nw')
         self.bindings_canvas.bind('<Configure>',lambda e: self.bindings_canvas.itemconfigure(panel_id,width=e.width))
         self.bindings_panel.bind('<Configure>',lambda e: self.bindings_canvas.configure(scrollregion=self.bindings_canvas.bbox('all')))
-        for col,groups in enumerate(BINDING_COLUMNS):
-            column=ttk.Frame(self.bindings_panel,padding=(0 if col==0 else 18,0,12,0))
-            column.grid(row=0,column=col,sticky='new')
-            self.bindings_panel.columnconfigure(col,weight=1,uniform='bindings')
-            for title,fields in groups:
-                box=ttk.Frame(column);box.pack(fill='x',pady=(0,14))
-                heading=ttk.Frame(box);heading.grid(row=0,column=0,columnspan=2,sticky='ew',pady=(0,7))
-                ttk.Label(heading,text=title,style='Heading.TLabel').pack(anchor='w')
-                ttk.Separator(heading,orient='horizontal').pack(fill='x',pady=(4,0))
-                for row,(key,label) in enumerate(fields,1): self.build_binding_row(box,row,key,label)
-                box.columnconfigure(0,minsize=150)
-                box.columnconfigure(1,weight=1)
-        def enable_scroll(widget):
-            widget.bind('<MouseWheel>',self.scroll_bindings,add='+')
-            for child in widget.winfo_children(): enable_scroll(child)
-        enable_scroll(self.bindings_canvas)
+        self.render_binding_fields()
         ttk.Label(outer, textvariable=self.status, wraplength=850, foreground='#b8a780').pack(anchor='w', pady=(6, 12))
         bottom = ttk.Frame(outer); bottom.pack(fill='x')
         for label, command in [('Read from game', self.read_current), ('Restore bindings…', self.restore), ('Import', self.import_preset), ('Export', self.export_preset)]:
@@ -415,11 +387,45 @@ class App:
         root.bind('<FocusOut>', self.capture_focus_out, add='+')
         root.bind('<Destroy>', lambda event: self.cancel_capture() if event.widget == root else None, add='+')
         root.protocol('WM_DELETE_WINDOW', self.close_manager)
-        if self.store['presets'] and not self.needs_upgrade():
+        if self.field_keys and self.store['presets'] and not self.needs_upgrade():
             self.name.set('Warrior' if 'Warrior' in self.store['presets'] else next(iter(self.store['presets'])))
             self.load()
         else:
             self.read_current()
+
+    def render_binding_fields(self):
+        for child in self.bindings_panel.winfo_children():child.destroy()
+        self.binding_entries.clear();self.binding_labels.clear();self.binding_frames.clear();self.clear_buttons.clear()
+        for col,groups in enumerate(binding_columns([key for key,_ in self.fields])):
+            column=ttk.Frame(self.bindings_panel,padding=(0 if col==0 else 18,0,12,0))
+            column.grid(row=0,column=col,sticky='new')
+            self.bindings_panel.columnconfigure(col,weight=1,uniform='bindings')
+            for title,fields in groups:
+                box=ttk.Frame(column);box.pack(fill='x',pady=(0,14))
+                heading=ttk.Frame(box);heading.grid(row=0,column=0,columnspan=2,sticky='ew',pady=(0,7))
+                ttk.Label(heading,text=title,style='Heading.TLabel').pack(anchor='w')
+                ttk.Separator(heading,orient='horizontal').pack(fill='x',pady=(4,0))
+                for row,(key,label) in enumerate(fields,1):self.build_binding_row(box,row,key,label)
+                box.columnconfigure(0,minsize=150);box.columnconfigure(1,weight=1)
+        def enable_scroll(widget):
+            widget.bind('<MouseWheel>',self.scroll_bindings,add='+')
+            for child in widget.winfo_children():enable_scroll(child)
+        enable_scroll(self.bindings_canvas)
+
+    def update_schema(self,document):
+        schema=Schema(document)
+        keys=set(schema.bindings)
+        self.document=document;self.schema=schema
+        if keys==self.field_keys:return
+        self.cancel_capture()
+        previous={key:value.get() for key,value in self.values.items()}
+        self.fields=[(key,binding_label(key)) for key in schema.bindings]
+        self.field_keys=keys
+        self.values={key:tk.StringVar(value=previous.get(key,'')) for key,_ in self.fields}
+        self.displays={key:tk.StringVar(value=value.get()) for key,value in self.values.items()}
+        self.edit_order={key:self.edit_order.get(key,0) for key in keys}
+        for key,value in self.values.items():value.trace_add('write',lambda *args,k=key:self.sync_display(k))
+        self.render_binding_fields()
 
     def scroll_bindings(self,event):
         self.bindings_canvas.yview_scroll(-int(event.delta/120),'units')
@@ -464,11 +470,11 @@ class App:
 
     def settings_path(self): return user_path(self.path.get())
     def needs_upgrade(self):
-        return self.store.get('version')!=2 or any(set(values)!=FIELD_KEYS for values in self.store['presets'].values())
+        return self.store.get('version')!=3 or any(set(values)!=self.field_keys for values in self.store['presets'].values())
     def form_values(self): return validate({k: var.get() for k, var in self.values.items()})
     def fill(self, values, priorities=None):
         self.cancel_capture()
-        values = validate(values)
+        values = complete_bindings(values,self.schema.values()) if self.schema else validate(values)
         self.loading_bindings = True
         try:
             priorities = priorities if isinstance(priorities,dict) else {}
@@ -501,6 +507,8 @@ class App:
         self.selected_label.set(self.name.get() or 'Current bindings')
 
     def select(self, name):
+        if not self.schema:
+            self.read_current();return
         if name not in self.store['presets']:
             if not self.store['presets']:
                 self.read_current()
@@ -543,8 +551,9 @@ class App:
             self.status.set('Open Arena of Champions and sign in first, or browse to its settings.ron file. No presets have been created.')
             return
         initialise = not self.store['presets']
-        upgrading = not initialise and self.needs_upgrade()
         def loaded(snapshot):
+            self.update_schema(snapshot['document'])
+            upgrading=not initialise and self.needs_upgrade()
             self.fill(snapshot['bindings'])
             if initialise:
                 self.data.mkdir(parents=True,exist_ok=True)
@@ -554,7 +563,7 @@ class App:
                 if snapshot['account'] is not None and not (self.data/'original-account-settings.json').exists():
                     atomic_write(self.data/'original-account-settings.json',json.dumps({'settings':snapshot['account']},indent=2).encode())
                 self.store['presets'] = {name:dict(snapshot['bindings']) for name in ['Original',*CLASSES]}
-                self.store['version'] = 2
+                self.store['version'] = 3
                 self.name.set('Warrior')
                 self.persist()
                 self.refresh()
@@ -564,7 +573,7 @@ class App:
                     stamp=datetime.now().strftime('%Y%m%d-%H%M%S-%f')
                     atomic_write(self.data/'backups'/(stamp+'-presets.json'),self.store_path.read_bytes())
                 self.store['presets']=upgraded
-                self.store['version']=2
+                self.store['version']=3
                 self.persist()
                 self.name.set('Warrior' if 'Warrior' in upgraded else next(iter(upgraded)))
                 self.load();self.refresh()
@@ -702,7 +711,8 @@ class App:
         path = filedialog.askopenfilename(parent=self.root,title='Restore bindings from a backup', initialdir=self.data / 'backups', filetypes=[('RON backup', '*.ron')])
         if not path: return
         values = read_bindings(user_path(path).read_bytes().decode('utf-8-sig'))
-        self.start_apply(validate(values), restoring=True)
+        baseline=read_bindings(self.settings_path().read_bytes().decode('utf-8-sig'))
+        self.start_apply(complete_bindings(values,baseline), restoring=True)
     def import_preset(self):
         path = filedialog.askopenfilename(parent=self.root,filetypes=[('Preset JSON', '*.json')])
         if not path: return
