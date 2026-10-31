@@ -4,9 +4,9 @@ keybinding preset manager for Arena of Champions
 
 ![AoC-bind-presets](docs/screenshot.png)
 
-Save a preset for each class and switch between them whenever you need. Works with **Action Bar** and **Beside the Bar**.
+Save a preset for each class and switch between them whenever you need. Edit all 29 game bindings: **Movement**, **Targeting**, **Action Bar**, **Beside the Bar**, **Camera**, and **Interface**.
 
-On the first launch, the app reads your saved game bindings and copies them to all nine classes. It also keeps a copy of your original settings. Your saved presets are kept on later launches.
+On the first launch, the app reads your saved game bindings and copies them to all nine classes. It also keeps a copy of your original settings. Your saved presets are kept on later launches. Older presets keep their combat bindings and pick up the remaining controls from your game settings. A backup is saved before updating them.
 
 ## How to use
 

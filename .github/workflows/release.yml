@@ -70,7 +70,7 @@ jobs:
             throw 'The executable failed its startup check.'
           }
           $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-          if ($result.status -ne 'ok' -or $result.class_buttons -ne 9 -or -not $result.initialised) {
+          if ($result.status -ne 'ok' -or $result.class_buttons -ne 9 -or -not $result.initialised -or $result.binding_count -ne 29) {
             throw 'The executable returned an unexpected startup result.'
           }
 

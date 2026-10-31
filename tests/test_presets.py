@@ -42,6 +42,14 @@ class PresetTests(unittest.TestCase):
         for value in ['Ctrl-Ctrl-KeyQ', 'KeyQ", forward: "KeyZ', 'Shift-Foo']:
             with self.assertRaises(ValueError): presets.canonical(value)
 
+    def test_restore_accepts_pasted_paths_with_quotes(self):
+        app=presets.App.__new__(presets.App)
+        app.data=FIXTURE.parent
+        app.start_apply=Mock()
+        for path in ['"'+str(FIXTURE)+'"','"'+str(FIXTURE), '\\"'+str(FIXTURE)+'\\"',str(FIXTURE)]:
+            with patch.object(presets.filedialog,'askopenfilename',return_value=path): app.restore()
+            app.start_apply.assert_called_with(presets.read_bindings(self.text),restoring=True)
+
     def test_empty_bindings_roundtrip_and_do_not_conflict(self):
         values = self.modified(); values['action_1']=''; values['action_2']=''; values['class_2']=''
         changed = presets.patch_settings(self.text,values)
@@ -176,17 +184,57 @@ class PresetTests(unittest.TestCase):
             self.assertEqual(snapshot['source'],'game')
             self.assertTrue(snapshot['notice'])
 
-    def test_remote_conflict_preserves_both_documents(self):
+    def test_full_restore_resolves_the_remote_focus_conflict(self):
         with tempfile.TemporaryDirectory() as temporary:
-            folder = Path(temporary); path = folder / 'settings.ron'; path.write_bytes(self.original)
-            (folder / 'session.ron').write_text('(token: "fake")')
-            remote = self.text.replace('forward: "KeyW"', 'forward: "Ctrl-KeyQ"')
-            def api(method, payload, token):
-                self.assertEqual(method, 'GET')
-                return {'settings': remote}
-            with self.assertRaises(ValueError):
-                presets.apply_synced_bindings(path, self.modified(), folder / 'backups', lambda: False, api)
-            self.assertEqual(path.read_bytes(), self.original)
+            folder=Path(temporary);path=folder/'settings.ron'
+            changed=self.text.replace('focus: "Digit5"','focus: "KeyF"')
+            path.write_bytes(changed.encode());(folder/'session.ron').write_text('(token: "fake")')
+            state={'settings':changed.replace('camera_speed: 1.0','camera_speed: 2.0')}
+            def api(method,payload,token):
+                if method=='PUT': state.update(payload);return {}
+                return dict(state)
+            original=presets.read_bindings(self.text)
+            presets.apply_synced_bindings(path,original,folder/'backups',lambda:False,api)
+            self.assertEqual(presets.read_bindings(state['settings'])['focus'],'Digit5')
+            self.assertEqual(presets.read_bindings(state['settings'])['action_3'],'KeyF')
+            self.assertIn('camera_speed: 2.0',state['settings'])
+            self.assertEqual(presets.read_bindings(path.read_text()),original)
+
+    def test_all_game_binding_groups_are_present(self):
+        values=presets.read_bindings(self.text)
+        self.assertEqual(len(values),29)
+        self.assertEqual(set(values),presets.FIELD_KEYS)
+        self.assertEqual(len({key for groups in presets.BINDING_COLUMNS for _,fields in groups for key,_ in fields}),29)
+
+    def test_old_presets_are_upgraded_without_losing_combat_bindings(self):
+        import json
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary);data=folder/'data';data.mkdir()
+            full=self.modified()
+            combat={key:value for key,value in full.items() if key in presets.COMBAT_KEYS}
+            previous={'version':1,'settings_path':str(FIXTURE),'presets':{'Original':dict(combat),'Warrior':dict(combat),'Mage':dict(combat)}}
+            previous['presets']['Mage']['action_2']='Alt-KeyB'
+            raw=json.dumps(previous,indent=2).encode();(data/'presets.json').write_bytes(raw)
+            with patch.object(presets,'BASE',folder):
+                root=presets.tk.Tk()
+                try:
+                    app=presets.App(root);root.update()
+                    self.assertEqual(app.store['version'],2)
+                    self.assertEqual(len(app.binding_entries),29)
+                    self.assertEqual({key:app.store['presets']['Mage'][key] for key in combat},previous['presets']['Mage'])
+                    self.assertEqual(app.store['presets']['Mage']['focus'],'Digit5')
+                    self.assertEqual(app.store['presets']['Mage']['forward'],'KeyW')
+                    self.assertEqual(next((data/'backups').glob('*-presets.json')).read_bytes(),raw)
+                    self.assertEqual(presets.DEFAULT_SETTINGS.read_bytes(),self.original)
+                finally:root.destroy()
+
+    def test_importing_combat_only_json_keeps_the_selected_controls(self):
+        baseline=presets.read_bindings(self.text);baseline['focus']='Ctrl-KeyB'
+        combat={key:value for key,value in self.modified().items() if key in presets.COMBAT_KEYS}
+        completed=presets.complete_bindings(combat,baseline)
+        self.assertEqual(completed['action_1'],'Ctrl-KeyQ')
+        self.assertEqual(completed['focus'],'Ctrl-KeyB')
+        self.assertEqual(len(completed),29)
 
     def test_gui_startup_does_not_modify_game_settings(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(presets, 'BASE', Path(temporary)):
@@ -198,6 +246,7 @@ class PresetTests(unittest.TestCase):
                 self.assertEqual(root.title(), 'AoC-bind-presets')
                 self.assertEqual(list(app.preset_buttons), ['Warrior', 'Mage', 'Priest', 'Rogue', 'Hunter', 'Paladin', 'Warlock', 'Druid', 'Shaman'])
                 self.assertEqual(app.form_values(), presets.read_bindings(self.text))
+                self.assertEqual(set(app.binding_entries),presets.FIELD_KEYS)
                 app.store['presets']['Mage']['action_1'] = 'Ctrl-KeyQ'
                 app.preset_buttons['Mage'].invoke()
                 self.assertEqual(app.name.get(), 'Mage')
@@ -229,6 +278,11 @@ class PresetTests(unittest.TestCase):
                 app.binding_entries['action_3'].event_generate('<KeyPress>', keycode=27)
                 self.assertIsNone(app.capture_state)
                 self.assertEqual(app.displays['action_3'].get(), app.values['action_3'].get())
+                app.values['focus'].set('Ctrl-KeyB')
+                app.values['action_3'].set('Ctrl-KeyB')
+                self.assertIn('focus',app.conflict_fields)
+                app.values['focus'].set('Digit5')
+                self.assertNotIn('focus',app.conflict_fields)
                 app.values['action_1'].set('Ctrl-KeyQ')
                 app.values['action_2'].set('Ctrl-KeyR')
                 app.capture('action_2')

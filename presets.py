@@ -24,11 +24,31 @@ BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__
 DEFAULT_SETTINGS = Path(os.environ.get('APPDATA', str(Path.home()))) / 'arena-of-champions' / 'settings.ron'
 RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 CLASSES = ['Warrior', 'Mage', 'Priest', 'Rogue', 'Hunter', 'Paladin', 'Warlock', 'Druid', 'Shaman']
-FIELDS = [(f'action_{i+1}', f'Action {i+1}') for i in range(8)] + [
+ACTION_FIELDS = [(f'action_{i+1}', f'Action {i+1}') for i in range(8)]
+BESIDE_FIELDS = [
     ('stealth', 'Class ability 1'), ('class_2', 'Class ability 2'),
     ('class_3', 'Class ability 3'), ('trinket', 'Utility 1'), ('utility_2', 'Utility 2')]
-SINGLE = [key for key, _ in FIELDS[8:]]
+MOVEMENT_FIELDS = [('forward','Move forward'),('back','Move back'),('left','Move left'),('right','Move right'),('jump','Jump')]
+TARGET_FIELDS = [('next_target','Target nearest enemy'),('focus','Set focus'),('focus_mouseover','Focus mouseover'),('target_focus','Target focus'),('target_self','Target self'),('target_teammate_1','Target teammate 1'),('target_teammate_2','Target teammate 2'),('inspect','Inspect target')]
+CAMERA_FIELDS = [('zoom_in','Zoom in'),('zoom_out','Zoom out')]
+INTERFACE_FIELDS = [('sheet','Spells & Talents')]
+FIELDS = ACTION_FIELDS + BESIDE_FIELDS + MOVEMENT_FIELDS + TARGET_FIELDS + CAMERA_FIELDS + INTERFACE_FIELDS
+COMBAT_KEYS = {key for key,_ in ACTION_FIELDS + BESIDE_FIELDS}
+FIELD_KEYS = {key for key,_ in FIELDS}
+SINGLE = [key for key,_ in FIELDS if not key.startswith('action_')]
+BINDING_COLUMNS = [
+    [('Movement',MOVEMENT_FIELDS),('Targeting',TARGET_FIELDS),('Camera',CAMERA_FIELDS)],
+    [('Action Bar',ACTION_FIELDS),('Beside the Bar',BESIDE_FIELDS),('Interface',INTERFACE_FIELDS)],
+]
 TOKEN = r'"([^"\\\r\n]*)"'
+
+
+def user_path(value):
+    # Windows paths cannot contain double quotes. File dialogs can return
+    # pasted paths with an unmatched opening quote as literal filename text.
+    text = str(value).strip().replace('\\"','"').strip('"').strip()
+    if len(text)>1 and text[0]==text[-1]=="'": text=text[1:-1]
+    return Path(text)
 
 
 def key_section(text):
@@ -89,10 +109,16 @@ def canonical(value):
 
 
 def validate(values):
-    if not isinstance(values, dict) or set(values) != {k for k, _ in FIELDS}:
-        raise ValueError('The preset must contain exactly 13 bindings.')
+    if not isinstance(values, dict) or set(values) != FIELD_KEYS:
+        raise ValueError(f'The preset must contain exactly {len(FIELDS)} bindings.')
     if not all(isinstance(v, str) for v in values.values()): raise ValueError('Bindings must be strings.')
     return {k: canonical(v) for k, v in values.items()}
+
+
+def complete_bindings(values, baseline):
+    if isinstance(values,dict) and set(values)==COMBAT_KEYS:
+        return validate({**validate(baseline),**values})
+    return validate(values)
 
 
 def validate_for_game(values):
@@ -264,11 +290,11 @@ class App:
         self.root = root
         self.data = BASE / 'data'
         self.store_path = self.data / 'presets.json'
-        self.store = {'version': 1, 'settings_path': str(DEFAULT_SETTINGS), 'presets': {}}
+        self.store = {'version': 2, 'settings_path': str(DEFAULT_SETTINGS), 'presets': {}}
         if self.store_path.exists():
             saved = json.loads(self.store_path.read_text(encoding='utf-8'))
             self.store = {key: saved[key] for key in ('version', 'settings_path', 'presets', 'binding_priorities') if key in saved}
-            if self.store.get('version') != 1: raise ValueError('Unsupported presets version.')
+            if self.store.get('version') not in (1,2): raise ValueError('Unsupported presets version.')
         self.path = tk.StringVar(value=self.store.get('settings_path', str(DEFAULT_SETTINGS)))
         self.name = tk.StringVar()
         self.values = {key: tk.StringVar() for key, _ in FIELDS}
@@ -293,8 +319,10 @@ class App:
         self.preset_buttons = {}
         root.title('AoC-bind-presets')
         root.iconbitmap(default=str(RESOURCES / 'icons' / 'app.ico'))
-        root.geometry('1120x810')
-        root.minsize(1080,780)
+        window_width=min(1180,root.winfo_screenwidth()-60)
+        window_height=min(950,root.winfo_screenheight()-100)
+        root.geometry(f'{window_width}x{window_height}')
+        root.minsize(min(1080,window_width),min(780,window_height))
         install_wc3_theme(root,RESOURCES)
         outer = ttk.Frame(root,style='Window.TFrame',padding=(34,30,34,28))
         outer.pack(fill='both',expand=True)
@@ -318,41 +346,32 @@ class App:
         ttk.Label(presets, textvariable=self.selected_label, style='Heading.TLabel').pack(side='left', fill='x', expand=True)
         for label, command in [('Save to…', self.save_as), ('Save', self.update), ('Reset', self.delete)]:
             ttk.Button(presets, text=label, command=lambda f=command: self.safe(f)).pack(side='left', padx=(8, 0))
-        columns = ttk.Frame(content); columns.pack(fill='both', expand=True)
-        for col, title, fields in [(0, 'Action Bar', FIELDS[:8]), (1, 'Beside the Bar', FIELDS[8:])]:
-            box = ttk.Frame(columns, padding=(0 if col == 0 else 26, 0, 16, 0))
-            box.grid(row=0, column=col, sticky='nsew')
-            columns.columnconfigure(col, weight=1)
-            heading = ttk.Frame(box)
-            heading.grid(row=0,column=0,columnspan=2,sticky='ew',pady=(0,8))
-            ttk.Label(heading,text=title,style='Heading.TLabel').pack(anchor='w')
-            ttk.Separator(heading,orient='horizontal').pack(fill='x',pady=(5,0))
-            for row, (key, label) in enumerate(fields, 1):
-                name_label = ttk.Label(box, text=label, cursor='hand2')
-                name_label.grid(row=row, column=0, sticky='w', padx=(0, 10), pady=9)
-                field = tk.Frame(box,bg='#211c13',highlightbackground='#8e7135',highlightthickness=1)
-                field.grid(row=row, column=1, sticky='ew', pady=9)
-                entry = ttk.Entry(field, textvariable=self.displays[key], width=24, state='readonly', cursor='hand2', style='Binding.TEntry',font=('Georgia',10,'bold'))
-                entry.pack(side='left',fill='x',expand=True)
-                clear = tk.Canvas(field,width=26,height=24,bg='#211c13',highlightthickness=0,cursor='hand2',takefocus=True)
-                clear.pack(side='right',padx=(1,3))
-                clear.create_line(7,8,19,8,fill='#b8a780',width=1.5,tags='bin')
-                clear.create_line(10,7,10,5,16,5,16,7,fill='#b8a780',width=1.5,tags='bin')
-                clear.create_line(8,10,9,20,17,20,18,10,fill='#b8a780',width=1.5,tags='bin')
-                clear.create_line(11,11,11,17,fill='#b8a780',width=1,tags='bin')
-                clear.create_line(15,11,15,17,fill='#b8a780',width=1,tags='bin')
-                self.add_tooltip(clear,'Clear binding')
-                clear.bind('<ButtonPress-1>',lambda event,k=key: self.clear_binding(k),add='+')
-                clear.bind('<Return>',lambda event,k=key: self.clear_binding(k))
-                clear.bind('<space>',lambda event,k=key: self.clear_binding(k))
-                self.binding_frames[key] = field
-                self.clear_buttons[key] = clear
-                self.binding_labels[key] = name_label
-                self.binding_entries[key] = entry
-                for widget in (name_label, entry):
-                    widget.bind('<ButtonPress-1>', lambda event, k=key: self.capture(k))
-                entry.bind('<Return>', lambda event, k=key: self.capture(k))
-            box.columnconfigure(1, weight=1)
+        controls = ttk.Frame(content); controls.pack(fill='both',expand=True)
+        self.bindings_canvas = tk.Canvas(controls,bg='#0d1217',highlightthickness=0)
+        self.bindings_canvas.pack(side='left',fill='both',expand=True)
+        control_scrollbar = ttk.Scrollbar(controls,orient='vertical',command=self.bindings_canvas.yview)
+        control_scrollbar.pack(side='right',fill='y')
+        self.bindings_canvas.configure(yscrollcommand=control_scrollbar.set)
+        self.bindings_panel = ttk.Frame(self.bindings_canvas)
+        panel_id = self.bindings_canvas.create_window((0,0),window=self.bindings_panel,anchor='nw')
+        self.bindings_canvas.bind('<Configure>',lambda e: self.bindings_canvas.itemconfigure(panel_id,width=e.width))
+        self.bindings_panel.bind('<Configure>',lambda e: self.bindings_canvas.configure(scrollregion=self.bindings_canvas.bbox('all')))
+        for col,groups in enumerate(BINDING_COLUMNS):
+            column=ttk.Frame(self.bindings_panel,padding=(0 if col==0 else 18,0,12,0))
+            column.grid(row=0,column=col,sticky='new')
+            self.bindings_panel.columnconfigure(col,weight=1,uniform='bindings')
+            for title,fields in groups:
+                box=ttk.Frame(column);box.pack(fill='x',pady=(0,14))
+                heading=ttk.Frame(box);heading.grid(row=0,column=0,columnspan=2,sticky='ew',pady=(0,7))
+                ttk.Label(heading,text=title,style='Heading.TLabel').pack(anchor='w')
+                ttk.Separator(heading,orient='horizontal').pack(fill='x',pady=(4,0))
+                for row,(key,label) in enumerate(fields,1): self.build_binding_row(box,row,key,label)
+                box.columnconfigure(0,minsize=150)
+                box.columnconfigure(1,weight=1)
+        def enable_scroll(widget):
+            widget.bind('<MouseWheel>',self.scroll_bindings,add='+')
+            for child in widget.winfo_children(): enable_scroll(child)
+        enable_scroll(self.bindings_canvas)
         ttk.Label(outer, textvariable=self.status, wraplength=850, foreground='#b8a780').pack(anchor='w', pady=(6, 12))
         bottom = ttk.Frame(outer); bottom.pack(fill='x')
         for label, command in [('Read from game', self.read_current), ('Restore bindings…', self.restore), ('Import', self.import_preset), ('Export', self.export_preset)]:
@@ -362,11 +381,41 @@ class App:
         root.bind('<FocusOut>', self.capture_focus_out, add='+')
         root.bind('<Destroy>', lambda event: self.cancel_capture() if event.widget == root else None, add='+')
         root.protocol('WM_DELETE_WINDOW', self.close_manager)
-        if self.store['presets']:
+        if self.store['presets'] and not self.needs_upgrade():
             self.name.set('Warrior' if 'Warrior' in self.store['presets'] else next(iter(self.store['presets'])))
             self.load()
         else:
             self.read_current()
+
+    def scroll_bindings(self,event):
+        self.bindings_canvas.yview_scroll(-int(event.delta/120),'units')
+        return 'break'
+
+    def build_binding_row(self,box,row,key,label):
+        name_label = ttk.Label(box, text=label, cursor='hand2')
+        name_label.grid(row=row, column=0, sticky='w', padx=(0, 10), pady=2)
+        field = tk.Frame(box,bg='#211c13',highlightbackground='#8e7135',highlightthickness=1)
+        field.grid(row=row, column=1, sticky='ew', pady=2)
+        entry = ttk.Entry(field, textvariable=self.displays[key], width=24, state='readonly', cursor='hand2', style='Binding.TEntry',font=('Georgia',10,'bold'))
+        entry.pack(side='left',fill='x',expand=True)
+        clear = tk.Canvas(field,width=26,height=24,bg='#211c13',highlightthickness=0,cursor='hand2',takefocus=True)
+        clear.pack(side='right',padx=(1,3))
+        clear.create_line(7,8,19,8,fill='#b8a780',width=1.5,tags='bin')
+        clear.create_line(10,7,10,5,16,5,16,7,fill='#b8a780',width=1.5,tags='bin')
+        clear.create_line(8,10,9,20,17,20,18,10,fill='#b8a780',width=1.5,tags='bin')
+        clear.create_line(11,11,11,17,fill='#b8a780',width=1,tags='bin')
+        clear.create_line(15,11,15,17,fill='#b8a780',width=1,tags='bin')
+        self.add_tooltip(clear,'Clear binding')
+        clear.bind('<ButtonPress-1>',lambda event,k=key: self.clear_binding(k),add='+')
+        clear.bind('<Return>',lambda event,k=key: self.clear_binding(k))
+        clear.bind('<space>',lambda event,k=key: self.clear_binding(k))
+        self.binding_frames[key] = field
+        self.clear_buttons[key] = clear
+        self.binding_labels[key] = name_label
+        self.binding_entries[key] = entry
+        for widget in (name_label, entry):
+            widget.bind('<ButtonPress-1>', lambda event, k=key: self.capture(k))
+        entry.bind('<Return>', lambda event, k=key: self.capture(k))
 
     def close_manager(self):
         if self.busy:
@@ -379,7 +428,9 @@ class App:
         try: function()
         except Exception as exc: messagebox.showerror('Could not complete the operation', str(exc), parent=self.root)
 
-    def settings_path(self): return Path(self.path.get().strip())
+    def settings_path(self): return user_path(self.path.get())
+    def needs_upgrade(self):
+        return self.store.get('version')!=2 or any(set(values)!=FIELD_KEYS for values in self.store['presets'].values())
     def form_values(self): return validate({k: var.get() for k, var in self.values.items()})
     def fill(self, values, priorities=None):
         self.cancel_capture()
@@ -451,13 +502,14 @@ class App:
         atomic_write(self.store_path, json.dumps(self.store, indent=2, ensure_ascii=False).encode('utf-8'))
     def browse(self):
         path = filedialog.askopenfilename(title='Select settings.ron', filetypes=[('RON settings', '*.ron')])
-        if path: self.path.set(path); self.read_current()
+        if path: self.path.set(str(user_path(path))); self.read_current()
     def read_current(self):
         path = self.settings_path()
         if not path.exists():
             self.status.set('Open Arena of Champions and sign in first, or browse to its settings.ron file. No presets have been created.')
             return
         initialise = not self.store['presets']
+        upgrading = not initialise and self.needs_upgrade()
         def loaded(snapshot):
             self.fill(snapshot['bindings'])
             if initialise:
@@ -468,13 +520,24 @@ class App:
                 if snapshot['account'] is not None and not (self.data/'original-account-settings.json').exists():
                     atomic_write(self.data/'original-account-settings.json',json.dumps({'settings':snapshot['account']},indent=2).encode())
                 self.store['presets'] = {name:dict(snapshot['bindings']) for name in ['Original',*CLASSES]}
+                self.store['version'] = 2
                 self.name.set('Warrior')
                 self.persist()
                 self.refresh()
+            elif upgrading:
+                upgraded = {name:complete_bindings(values,snapshot['bindings']) for name,values in self.store['presets'].items()}
+                if self.store_path.exists():
+                    stamp=datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+                    atomic_write(self.data/'backups'/(stamp+'-presets.json'),self.store_path.read_bytes())
+                self.store['presets']=upgraded
+                self.store['version']=2
+                self.persist()
+                self.name.set('Warrior' if 'Warrior' in upgraded else next(iter(upgraded)))
+                self.load();self.refresh()
             else:
                 self.name.set('')
                 self.highlight_selection()
-            self.status.set(snapshot['notice'] or ('Current bindings saved for all nine classes.' if initialise else 'Current '+snapshot['source']+' bindings loaded.'))
+            self.status.set(snapshot['notice'] or ('Your presets now include all game bindings.' if upgrading else 'Current bindings saved for all nine classes.' if initialise else 'Current '+snapshot['source']+' bindings loaded.'))
         if not any((path.parent/name).exists() for name in ('session.ron','guest.ron')):
             loaded(read_game_snapshot(path))
             return
@@ -605,20 +668,20 @@ class App:
     def restore(self):
         path = filedialog.askopenfilename(title='Restore bindings from a backup', initialdir=self.data / 'backups', filetypes=[('RON backup', '*.ron')])
         if not path: return
-        values = read_bindings(Path(path).read_bytes().decode('utf-8-sig'))
+        values = read_bindings(user_path(path).read_bytes().decode('utf-8-sig'))
         self.start_apply(validate(values), restoring=True)
     def import_preset(self):
         path = filedialog.askopenfilename(filetypes=[('Preset JSON', '*.json')])
         if not path: return
-        payload = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-        self.fill(payload['bindings'])
+        payload = json.loads(user_path(path).read_text(encoding='utf-8-sig'))
+        self.fill(complete_bindings(payload['bindings'],self.form_values()))
         self.name.set('')
         self.highlight_selection()
         self.status.set('Preset imported. Use Save to to choose its class.')
     def export_preset(self):
         values = self.form_values()
         path = filedialog.asksaveasfilename(defaultextension='.json', initialfile=(self.name.get() or 'preset') + '.json', filetypes=[('Preset JSON', '*.json')])
-        if path: atomic_write(Path(path), json.dumps({'name': self.name.get(), 'bindings': values}, indent=2, ensure_ascii=False).encode('utf-8'))
+        if path: atomic_write(user_path(path), json.dumps({'name': self.name.get(), 'bindings': values}, indent=2, ensure_ascii=False).encode('utf-8'))
 
     def sync_display(self, key):
         if not self.capture_state or self.capture_state['key'] != key:
@@ -773,6 +836,7 @@ if __name__ == '__main__':
                 return
             result = {'status': 'ok', 'bindings': app.form_values(), 'presets': list(app.store['presets']),
                       'initialised': all(name in app.store['presets'] for name in CLASSES),
+                      'binding_count': len(app.binding_entries),
                       'title': root.title(), 'class_buttons': len(app.preset_buttons),
                       'window': [root.winfo_width(), root.winfo_height()]}
             atomic_write(Path(sys.argv[2]), json.dumps(result, indent=2).encode())
