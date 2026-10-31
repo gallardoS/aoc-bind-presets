@@ -44,6 +44,7 @@ class PresetTests(unittest.TestCase):
 
     def test_restore_accepts_pasted_paths_with_quotes(self):
         app=presets.App.__new__(presets.App)
+        app.root=Mock()
         app.data=FIXTURE.parent
         app.start_apply=Mock()
         for path in ['"'+str(FIXTURE)+'"','"'+str(FIXTURE), '\\"'+str(FIXTURE)+'\\"',str(FIXTURE)]:

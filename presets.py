@@ -51,6 +51,40 @@ def user_path(value):
     return Path(text)
 
 
+def center_dialog(dialog, parent):
+    parent.update_idletasks()
+    dialog.update_idletasks()
+    width,height=dialog.winfo_reqwidth(),dialog.winfo_reqheight()
+    x=parent.winfo_rootx()+(parent.winfo_width()-width)//2
+    y=parent.winfo_rooty()+(parent.winfo_height()-height)//2
+    dialog.geometry(f'{width}x{height}+{max(0,x)}+{max(0,y)}')
+    dialog.deiconify()
+    if os.name=='nt':
+        # Win32 coordinates also handle monitors to the left of the primary
+        # screen, where Tk's negative geometry offsets have another meaning.
+        from ctypes import wintypes as w
+        class MonitorInfo(ctypes.Structure):
+            _fields_=[('cbSize',w.DWORD),('rcMonitor',w.RECT),('rcWork',w.RECT),('dwFlags',w.DWORD)]
+        user=ctypes.WinDLL('user32',use_last_error=True)
+        user.GetAncestor.argtypes=[w.HWND,w.UINT];user.GetAncestor.restype=w.HWND
+        user.GetWindowRect.argtypes=[w.HWND,ctypes.POINTER(w.RECT)]
+        user.MonitorFromWindow.argtypes=[w.HWND,w.DWORD];user.MonitorFromWindow.restype=w.HANDLE
+        user.GetMonitorInfoW.argtypes=[w.HANDLE,ctypes.POINTER(MonitorInfo)]
+        user.SetWindowPos.argtypes=[w.HWND,w.HWND,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,w.UINT]
+        owner=user.GetAncestor(parent.winfo_id(),2)
+        popup=user.GetAncestor(dialog.winfo_id(),2)
+        owner_rect,popup_rect=w.RECT(),w.RECT()
+        if user.GetWindowRect(owner,ctypes.byref(owner_rect)) and user.GetWindowRect(popup,ctypes.byref(popup_rect)):
+            width,height=popup_rect.right-popup_rect.left,popup_rect.bottom-popup_rect.top
+            x=(owner_rect.left+owner_rect.right-width)//2
+            y=(owner_rect.top+owner_rect.bottom-height)//2
+            info=MonitorInfo();info.cbSize=ctypes.sizeof(info)
+            if user.GetMonitorInfoW(user.MonitorFromWindow(owner,2),ctypes.byref(info)):
+                x=max(info.rcWork.left,min(x,info.rcWork.right-width))
+                y=max(info.rcWork.top,min(y,info.rcWork.bottom-height))
+            user.SetWindowPos(popup,None,x,y,0,0,0x15)
+
+
 def key_section(text):
     """Locate keys independently of the surrounding settings structure."""
     matches = list(re.finditer(r'\bkeys\s*:\s*\(', text))
@@ -501,7 +535,7 @@ class App:
         self.store['settings_path'] = self.path.get()
         atomic_write(self.store_path, json.dumps(self.store, indent=2, ensure_ascii=False).encode('utf-8'))
     def browse(self):
-        path = filedialog.askopenfilename(title='Select settings.ron', filetypes=[('RON settings', '*.ron')])
+        path = filedialog.askopenfilename(parent=self.root,title='Select settings.ron', filetypes=[('RON settings', '*.ron')])
         if path: self.path.set(str(user_path(path))); self.read_current()
     def read_current(self):
         path = self.settings_path()
@@ -564,7 +598,7 @@ class App:
         self.status.set('')
     def save_as(self):
         values = self.form_values()
-        dialog = tk.Toplevel(self.root); dialog.title('Save to class'); dialog.transient(self.root)
+        dialog = tk.Toplevel(self.root); dialog.withdraw(); dialog.title('Save to class'); dialog.transient(self.root)
         dialog.configure(bg='#0d1217'); dialog.resizable(False, False)
         panel = ttk.Frame(dialog, padding=22); panel.pack()
         name_var = tk.StringVar(value=self.name.get() if self.name.get() in CLASSES else 'Warrior')
@@ -581,6 +615,7 @@ class App:
             self.status.set(f'"{name}" saved.'); dialog.destroy()
         ttk.Button(panel, text='Cancel', command=dialog.destroy).grid(row=2, column=0, pady=(16, 0))
         ttk.Button(panel, text='Save', command=lambda: self.safe(save)).grid(row=2, column=1, sticky='e', pady=(16, 0))
+        center_dialog(dialog,self.root)
         dialog.grab_set(); entry.focus_set()
     def update(self):
         name = self.name.get()
@@ -606,6 +641,7 @@ class App:
         if self.restart_dialog is not None and self.restart_dialog.winfo_exists():
             self.restart_dialog.focus_force(); return
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         self.restart_dialog = dialog
         dialog.title('Restart Arena of Champions?')
         dialog.transient(self.root); dialog.resizable(False,False)
@@ -626,10 +662,7 @@ class App:
         ttk.Button(buttons,text='Restart and apply',command=accept).pack(side='right',padx=(0,8))
         dialog.protocol('WM_DELETE_WINDOW',cancel)
         dialog.bind('<Escape>',lambda event: cancel())
-        dialog.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width()-dialog.winfo_width())//2
-        y = self.root.winfo_rooty() + (self.root.winfo_height()-dialog.winfo_height())//2
-        dialog.geometry(f'+{max(0,x)}+{max(0,y)}')
+        center_dialog(dialog,self.root)
         dialog.grab_set(); cancel_button.focus_set()
 
     def start_apply(self, values, restoring=False, game=None, approved=False):
@@ -666,12 +699,12 @@ class App:
             messagebox.showinfo('Bindings applied', 'Account and local bindings were updated and verified.\n' + ('Arena of Champions was restarted.' if restarted else 'You can now start the game.'), parent=self.root)
         self.root.after(80, poll)
     def restore(self):
-        path = filedialog.askopenfilename(title='Restore bindings from a backup', initialdir=self.data / 'backups', filetypes=[('RON backup', '*.ron')])
+        path = filedialog.askopenfilename(parent=self.root,title='Restore bindings from a backup', initialdir=self.data / 'backups', filetypes=[('RON backup', '*.ron')])
         if not path: return
         values = read_bindings(user_path(path).read_bytes().decode('utf-8-sig'))
         self.start_apply(validate(values), restoring=True)
     def import_preset(self):
-        path = filedialog.askopenfilename(filetypes=[('Preset JSON', '*.json')])
+        path = filedialog.askopenfilename(parent=self.root,filetypes=[('Preset JSON', '*.json')])
         if not path: return
         payload = json.loads(user_path(path).read_text(encoding='utf-8-sig'))
         self.fill(complete_bindings(payload['bindings'],self.form_values()))
@@ -680,7 +713,7 @@ class App:
         self.status.set('Preset imported. Use Save to to choose its class.')
     def export_preset(self):
         values = self.form_values()
-        path = filedialog.asksaveasfilename(defaultextension='.json', initialfile=(self.name.get() or 'preset') + '.json', filetypes=[('Preset JSON', '*.json')])
+        path = filedialog.asksaveasfilename(parent=self.root,defaultextension='.json', initialfile=(self.name.get() or 'preset') + '.json', filetypes=[('Preset JSON', '*.json')])
         if path: atomic_write(user_path(path), json.dumps({'name': self.name.get(), 'bindings': values}, indent=2, ensure_ascii=False).encode('utf-8'))
 
     def sync_display(self, key):
