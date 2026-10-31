@@ -20,6 +20,8 @@ If the game is open, you can accept or cancel its restart. Duplicate bindings tu
 
 Download the `.exe` from the [latest release](https://github.com/gallardoS/aoc-bind-presets/releases/latest) and open it. No installation needed.
 
+The app checks for updates when opened. If a newer release is available, it downloads it and restarts automatically. Your presets and any bindings you were editing are kept. If you are offline, you can keep using the app.
+
 For Windows. Sign in to Arena of Champions at least once before using the app. Applying presets requires an internet connection.
 
 Your presets are saved in the `data` folder next to the app. Keep that folder when moving or updating the app.

@@ -867,6 +867,12 @@ class App:
 
 
 if __name__ == '__main__':
+    if len(sys.argv)==3 and sys.argv[1]=='--install-update':
+        if not getattr(sys,'frozen',False):sys.exit(2)
+        try:
+            from app_updates import install_update
+            sys.exit(0 if install_update(sys.argv[2]) else 1)
+        except Exception:sys.exit(1)
     try:
         if os.name == 'nt':
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('AoC.BindPresets')
@@ -892,5 +898,10 @@ if __name__ == '__main__':
             atomic_write(Path(sys.argv[2]), json.dumps(result, indent=2).encode())
             root.destroy()
         root.after(500, finish_smoke)
+    else:
+        from app_updates import UpdateController
+        updated=sys.argv[2] if len(sys.argv)==3 and sys.argv[1]=='--updated' else None
+        app.updater=UpdateController(app)
+        app.updater.start(check=bool(getattr(sys,'frozen',False)) and not updated and '--skip-update-check' not in sys.argv,cleanup=updated)
     root.mainloop()
     if scratch: scratch.cleanup()

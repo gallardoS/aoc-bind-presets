@@ -28,7 +28,7 @@ a = Analysis(
     ['presets.py'],
     pathex=[],
     binaries=[],
-    datas=[('icons', 'icons')],
+    datas=[('icons', 'icons'), ('VERSION', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

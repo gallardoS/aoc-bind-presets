@@ -1,0 +1,325 @@
+"""Verified GitHub releases and a separate Windows replacement helper."""
+from dataclasses import dataclass
+import ctypes
+from ctypes import wintypes as w
+import hashlib
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+REPOSITORY='gallardoS/aoc-bind-presets'
+LATEST_URL=f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
+ASSET_NAME='AoC-bind-presets.exe'
+OWNER='AoC-bind-presets updater'
+MAX_DOWNLOAD=256*1024*1024
+
+
+def version_tuple(value):
+    match=re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)',str(value).strip())
+    if not match:raise ValueError('Unrecognized release version.')
+    return tuple(int(part) for part in match.groups())
+
+
+def current_version():
+    root=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))
+    value=(root/'VERSION').read_text(encoding='utf-8-sig').strip()
+    version_tuple(value)
+    return value
+
+
+class HTTPSRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,req,fp,code,msg,headers,newurl):
+        parsed=urllib.parse.urlsplit(newurl)
+        if parsed.scheme!='https' or not (parsed.hostname in ('github.com','api.github.com') or (parsed.hostname or '').endswith('.githubusercontent.com')):
+            raise ValueError('Unexpected update download location.')
+        return super().redirect_request(req,fp,code,msg,headers,newurl)
+
+
+def open_url(url):
+    request=urllib.request.Request(url,headers={'User-Agent':'AoC-bind-presets updater','Accept':'application/vnd.github+json' if url==LATEST_URL else 'application/octet-stream'})
+    return urllib.request.build_opener(HTTPSRedirects()).open(request,timeout=20)
+
+
+def latest_release():
+    with open_url(LATEST_URL) as response:
+        raw=response.read(2_000_001)
+    if len(raw)>2_000_000:raise ValueError('Unexpected release response.')
+    return json.loads(raw)
+
+
+def asset_url(asset,tag):
+    url=asset.get('browser_download_url','')
+    parsed=urllib.parse.urlsplit(url)
+    expected=f'/{REPOSITORY}/releases/download/{tag}/{asset["name"]}'
+    if parsed.scheme!='https' or parsed.hostname!='github.com' or urllib.parse.unquote(parsed.path)!=expected or parsed.query or parsed.fragment:
+        raise ValueError('Unexpected update asset URL.')
+    return url
+
+
+@dataclass
+class Update:
+    version: str
+    url: str
+    size: int
+    sha256: str|None
+    checksum_url: str|None
+
+
+def find_update(release,installed):
+    if release.get('draft') or release.get('prerelease'):return None
+    tag=release.get('tag_name','')
+    latest=version_tuple(tag)
+    if latest<=version_tuple(installed):return None
+    assets=release.get('assets',[])
+    candidates=[asset for asset in assets if asset.get('name')==ASSET_NAME and asset.get('state')=='uploaded']
+    if len(candidates)!=1:raise ValueError('The release executable is unavailable.')
+    asset=candidates[0];size=asset.get('size',0)
+    if not isinstance(size,int) or not 0<size<=MAX_DOWNLOAD:raise ValueError('Unexpected update size.')
+    digest=asset.get('digest') or ''
+    checksum=None
+    if re.fullmatch(r'sha256:[0-9a-fA-F]{64}',digest):checksum=digest.split(':')[1].lower()
+    checksum_asset=next((a for a in assets if a.get('name')=='SHA256SUMS.txt' and a.get('state')=='uploaded'),None)
+    checksum_url=asset_url(checksum_asset,tag) if checksum_asset else None
+    if not checksum and not checksum_url:raise ValueError('The update cannot be verified.')
+    return Update('.'.join(map(str,latest)),asset_url(asset,tag),size,checksum,checksum_url)
+
+
+def file_hash(path):
+    digest=hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b''):digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_version(path):
+    api=ctypes.WinDLL('version',use_last_error=True)
+    api.GetFileVersionInfoSizeW.argtypes=[w.LPCWSTR,ctypes.POINTER(w.DWORD)]
+    api.GetFileVersionInfoW.argtypes=[w.LPCWSTR,w.DWORD,w.DWORD,w.LPVOID]
+    api.VerQueryValueW.argtypes=[w.LPCVOID,w.LPCWSTR,ctypes.POINTER(ctypes.c_void_p),ctypes.POINTER(w.UINT)]
+    ignored=w.DWORD();size=api.GetFileVersionInfoSizeW(str(path),ctypes.byref(ignored))
+    if not size:raise ValueError('The update has no version information.')
+    buffer=ctypes.create_string_buffer(size)
+    if not api.GetFileVersionInfoW(str(path),0,size,buffer):raise ValueError('Could not read the update version.')
+    pointer=ctypes.c_void_p();length=w.UINT()
+    if not api.VerQueryValueW(buffer,'\\',ctypes.byref(pointer),ctypes.byref(length)) or length.value<16:
+        raise ValueError('Invalid executable version information.')
+    signature,_,major_minor,patch_build=struct.unpack('<IIII',ctypes.string_at(pointer,16))
+    if signature!=0xFEEF04BD:raise ValueError('Invalid executable version information.')
+    return (major_minor>>16,major_minor&65535,patch_build>>16)
+
+
+def verify_executable(path,expected_hash,version,read_version=file_version):
+    if file_hash(path)!=expected_hash:raise ValueError('The update download is damaged.')
+    with path.open('rb') as stream:
+        header=stream.read(64)
+        if len(header)!=64 or header[:2]!=b'MZ':raise ValueError('The update is not a Windows executable.')
+        offset=struct.unpack_from('<I',header,60)[0]
+        if not 64<=offset<=path.stat().st_size-24:raise ValueError('The update executable is incomplete.')
+        stream.seek(offset);pe=stream.read(6)
+        if pe[:4]!=b'PE\0\0' or pe[4:]!=b'\x64\x86':raise ValueError('The update is not a Windows x64 executable.')
+    if tuple(read_version(path))!=version_tuple(version):raise ValueError('The download does not match the release version.')
+
+
+def download_update(update,directory,fetch=open_url,read_version=file_version):
+    expected=update.sha256
+    if expected is None:
+        with fetch(update.checksum_url) as response:raw=response.read(65537)
+        if len(raw)>65536:raise ValueError('Invalid update checksum file.')
+        matches=re.findall(r'^([0-9a-fA-F]{64})\s+\*?AoC-bind-presets\.exe\s*$',raw.decode('utf-8-sig'),re.M)
+        if len(matches)!=1:raise ValueError('The update checksum is missing.')
+        expected=matches[0].lower()
+    destination=directory/'candidate.exe';received=0;started=time.monotonic()
+    try:
+        with fetch(update.url) as response,destination.open('xb') as stream:
+            while True:
+                chunk=response.read(1024*1024)
+                if not chunk:break
+                received+=len(chunk)
+                if received>update.size or received>MAX_DOWNLOAD or time.monotonic()-started>180:
+                    raise ValueError('Unexpected update download size or duration.')
+                stream.write(chunk)
+            stream.flush();os.fsync(stream.fileno())
+        if received!=update.size:raise ValueError('The update download is incomplete.')
+        verify_executable(destination,expected,update.version,read_version)
+        return destination,expected
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def wait_for_exit(pids,timeout=60):
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    kernel.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];kernel.OpenProcess.restype=w.HANDLE
+    kernel.WaitForSingleObject.argtypes=[w.HANDLE,w.DWORD]
+    kernel.CloseHandle.argtypes=[w.HANDLE]
+    deadline=time.monotonic()+timeout
+    for pid in pids:
+        handle=kernel.OpenProcess(0x100000,False,int(pid))
+        if not handle:continue
+        try:
+            remaining=max(0,int((deadline-time.monotonic())*1000))
+            if kernel.WaitForSingleObject(handle,remaining)!=0:raise ValueError('The previous app is still running.')
+        finally:kernel.CloseHandle(handle)
+
+
+def launch_app(target,stage):
+    return subprocess.Popen([str(target),'--updated',str(stage)],cwd=str(target.parent),close_fds=True)
+
+
+def write_result(target,ok,message):
+    data=target.parent/'data';data.mkdir(parents=True,exist_ok=True)
+    temporary=data/'update-result.tmp'
+    temporary.write_text(json.dumps({'ok':ok,'message':message}),encoding='utf-8')
+    os.replace(temporary,data/'update-result.json')
+
+
+def install_update(manifest_path,wait=wait_for_exit,launch=launch_app,read_version=file_version):
+    manifest_path=Path(manifest_path).resolve();stage=manifest_path.parent
+    manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+    target=Path(manifest['target']).resolve()
+    if manifest.get('owner')!=OWNER or stage.parent!=target.parent or not stage.name.startswith('.aoc-update-') or manifest_path.name!='manifest.json':
+        raise ValueError('Invalid update staging folder.')
+    if not re.fullmatch(r'AoC-bind-presets(?: \(\d+\))?\.exe',target.name,re.I):raise ValueError('Unexpected update target.')
+    candidate=stage/'candidate.exe';backup=stage/'previous.exe';replaced=False
+    try:
+        wait(manifest['pids'])
+        verify_executable(candidate,manifest['sha256'],manifest['version'],read_version)
+        if file_hash(target)!=manifest['original_sha256']:
+            write_result(target,False,'The app changed during the update. Please open it again.')
+            launch(target,stage);return False
+        shutil.copy2(target,backup)
+        deadline=time.monotonic()+15
+        while True:
+            try:os.replace(candidate,target);break
+            except PermissionError:
+                if time.monotonic()>=deadline:raise ValueError('The app executable is still locked.')
+                time.sleep(.25)
+        replaced=True
+        write_result(target,True,'Updated to v'+manifest['version']+'.')
+        launch(target,stage)
+        return True
+    except Exception:
+        if replaced and backup.exists():os.replace(backup,target)
+        write_result(target,False,'The app could not update. Your previous version and presets have been kept.')
+        launch(target,stage)
+        return False
+
+
+def prepare_install(target,stage,version,digest):
+    if not re.fullmatch(r'AoC-bind-presets(?: \(\d+\))?\.exe',target.name,re.I):
+        raise ValueError('Keep the standard app filename to install updates automatically.')
+    if stage.resolve().parent!=target.resolve().parent:
+        raise ValueError('The app and update must be in the same folder.')
+    manifest={'owner':OWNER,'target':str(target.resolve()),'version':version,'sha256':digest,
+              'original_sha256':file_hash(target),'pids':[os.getpid(),os.getppid()]}
+    (stage/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
+    helper=stage/'update-helper.exe';shutil.copy2(target,helper)
+    return subprocess.Popen([str(helper),'--install-update',str(stage/'manifest.json')],cwd=str(stage),creationflags=subprocess.CREATE_NO_WINDOW,close_fds=True)
+
+
+def cleanup_stage(stage,base):
+    stage=Path(stage).resolve();base=Path(base).resolve()
+    if stage.parent!=base or not stage.name.startswith('.aoc-update-'):return
+    manifest=stage/'manifest.json'
+    try:
+        if json.loads(manifest.read_text()).get('owner')!=OWNER:return
+        for name in ('candidate.exe','previous.exe','update-helper.exe','manifest.json'):
+            (stage/name).unlink(missing_ok=True)
+        stage.rmdir()
+    except (OSError,ValueError):pass
+
+
+class UpdateController:
+    def __init__(self,app):
+        self.app=app;self.root=app.root;self.results=queue.SimpleQueue();self.pending=None;self.draft_restored=False
+
+    def idle(self):
+        app=self.app
+        if app.busy or app.capture_state or self.root.grab_current() is not None:return False
+        if any(child.winfo_viewable() and not child.overrideredirect() for child in self.root.winfo_children() if child.winfo_class()=='Toplevel'):return False
+        if os.name=='nt':
+            user=ctypes.WinDLL('user32')
+            user.GetAncestor.argtypes=[w.HWND,w.UINT];user.GetAncestor.restype=w.HWND
+            user.IsWindowEnabled.argtypes=[w.HWND]
+            if not user.IsWindowEnabled(user.GetAncestor(self.root.winfo_id(),2)):return False
+            if any(user.GetAsyncKeyState(key)&0x8000 for key in (1,2,4,5,6,16,17,18)):return False
+        return True
+
+    def start(self,check=True,cleanup=None):
+        if cleanup:self.root.after(2500,lambda:cleanup_stage(cleanup,self.app.data.parent))
+        self.root.after(150,self.restore_draft)
+        if not check:return
+        def worker():
+            stage=None
+            try:
+                update=find_update(latest_release(),current_version())
+                if update is None:self.results.put(('done',None));return
+                self.results.put(('downloading',update.version))
+                stage=Path(tempfile.mkdtemp(prefix='.aoc-update-',dir=self.app.data.parent))
+                _,digest=download_update(update,stage)
+                self.results.put(('ready',(stage,update.version,digest)))
+            except Exception:
+                if stage:
+                    try:
+                        (stage/'candidate.exe').unlink(missing_ok=True)
+                        stage.rmdir()
+                    except OSError:pass
+                self.results.put(('error',None))
+        threading.Thread(target=worker,daemon=True).start()
+        self.root.after(150,self.poll)
+
+    def restore_draft(self):
+        if not self.idle():self.root.after(150,self.restore_draft);return
+        path=self.app.data/'update-draft.json'
+        if path.exists():
+            try:
+                draft=json.loads(path.read_text(encoding='utf-8'))
+                self.app.fill(draft['bindings'],draft.get('priorities'))
+                name=draft.get('name','')
+                self.app.name.set(name if name in self.app.store['presets'] else '')
+                self.app.highlight_selection();path.unlink()
+            except (OSError,ValueError,KeyError):self.app.status.set('Could not restore the editing draft. Your saved presets are unchanged.')
+        result=self.app.data/'update-result.json'
+        if result.exists():
+            try:self.app.status.set(json.loads(result.read_text(encoding='utf-8'))['message']);result.unlink()
+            except (OSError,ValueError,KeyError):pass
+        self.draft_restored=True
+
+    def poll(self):
+        try:
+            while True:
+                kind,value=self.results.get_nowait()
+                if kind=='done':return
+                if kind=='error':
+                    if self.idle():self.app.status.set('Could not check for updates. You can keep using the app.')
+                    return
+                if kind=='downloading' and self.idle():self.app.status.set('Downloading update v'+value+'…')
+                if kind=='ready':self.pending=value
+        except queue.Empty:pass
+        if self.pending and self.draft_restored and self.idle():
+            stage,version,digest=self.pending
+            try:
+                draft={'name':self.app.name.get(),'bindings':self.app.form_values(),'priorities':self.app.edit_order}
+                self.app.data.mkdir(parents=True,exist_ok=True)
+                path=self.app.data/'update-draft.json';temporary=path.with_suffix('.tmp')
+                temporary.write_text(json.dumps(draft),encoding='utf-8');os.replace(temporary,path)
+                self.app.busy=True;self.app.status.set('Updating to v'+version+'… Restarting the app.')
+                prepare_install(Path(sys.executable),stage,version,digest)
+                self.root.destroy()
+                return
+            except Exception:
+                (self.app.data/'update-draft.json').unlink(missing_ok=True)
+                self.app.busy=False;self.app.status.set('Could not install the update. You can keep using the app.')
+                return
+        self.root.after(150,self.poll)
