@@ -95,6 +95,14 @@ def validate(values):
     return {k: canonical(v) for k, v in values.items()}
 
 
+def validate_for_game(values):
+    values = validate(values)
+    empty = [label for key,label in FIELDS if not values[key]]
+    if empty:
+        raise ValueError('Arena of Champions cannot load empty bindings. Assign a key before applying:\n\n'+'\n'.join(empty))
+    return values
+
+
 def patch_settings(text, values):
     values = validate(values)
     spans = binding_spans(text)
@@ -143,6 +151,7 @@ def atomic_write(path, data):
 
 
 def apply_bindings(path, values, backup_dir, check_game=game_running):
+    values = validate_for_game(values)
     if check_game(): raise ValueError('Close Arena of Champions before applying a preset.')
     before = path.read_bytes()
     text = before.decode('utf-8-sig')
@@ -178,22 +187,45 @@ def account_api(method, payload, token):
         raise ValueError('Could not reach the game server. Check your connection and try again.') from None
 
 
+def session_token(path):
+    session_path = path.parent / 'session.ron'
+    if not session_path.exists(): session_path = path.parent / 'guest.ron'
+    if not session_path.exists(): return None
+    session = session_path.read_text(encoding='utf-8-sig')
+    match = re.search(r'\btoken\s*:\s*"([^"\r\n]+)"',session)
+    if not match: raise ValueError('The saved game session is not recognized. Sign in to the game again.')
+    return match.group(1)
+
+
+def read_game_snapshot(path, api=None):
+    local = path.read_bytes()
+    bindings = validate(read_bindings(local.decode('utf-8-sig')))
+    snapshot = {'local':local,'bindings':bindings,'account':None,'source':'game','notice':''}
+    try:
+        token = session_token(path)
+        if token:
+            response = (api or account_api)('GET',None,token)
+            remote = response.get('settings') if isinstance(response,dict) else None
+            if isinstance(remote,str):
+                snapshot.update(bindings=validate(read_bindings(remote)),account=remote,source='account')
+    except (ValueError,OSError):
+        snapshot['notice'] = 'Account settings could not be checked. Loaded the local game settings.'
+    if any(not value for value in snapshot['bindings'].values()):
+        snapshot['notice'] = 'Your saved settings contain empty bindings the game cannot load. Assign keys before applying.'
+    return snapshot
+
+
 def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api=account_api):
     """Patch only our bindings in both existing documents, keeping tokens in memory."""
-    values = validate(values)
+    values = validate_for_game(values)
     if check_game(): raise ValueError('Close Arena of Champions before applying a preset.')
     before = path.read_bytes()
     local = before.decode('utf-8-sig')
     issues = conflicts(local, values)
     if issues: raise ValueError('Duplicate bindings:\n\n' + '\n'.join(issues))
-    session_path = path.parent / 'session.ron'
-    if not session_path.exists(): session_path = path.parent / 'guest.ron'
-    if not session_path.exists():
+    token = session_token(path)
+    if not token:
         raise ValueError('No game session found. Sign in to the game, close it, then apply again.')
-    session = session_path.read_text(encoding='utf-8-sig')
-    match = re.search(r'\btoken\s*:\s*"([^"\r\n]+)"', session)
-    if not match: raise ValueError('The saved game session is not recognized. Sign in to the game again.')
-    token = match.group(1)
     response = api('GET', None, token)
     remote = response.get('settings') if isinstance(response, dict) else None
     if not isinstance(remote, str):
@@ -326,21 +358,15 @@ class App:
         for label, command in [('Read from game', self.read_current), ('Restore bindings…', self.restore), ('Import', self.import_preset), ('Export', self.export_preset)]:
             ttk.Button(bottom, text=label, command=lambda f=command: self.safe(f)).pack(side='left', padx=(0, 6))
         ttk.Button(bottom, text='Apply preset', command=lambda: self.safe(self.apply)).pack(side='right')
-        if self.settings_path().exists():
-            self.read_current()
-            if not self.store['presets']:
-                self.store['presets']['Original'] = self.form_values()
-            for class_name in CLASSES:
-                if class_name not in self.store['presets']:
-                    self.store['presets'][class_name] = self.form_values()
-            self.persist()
-            if self.store['presets']:
-                self.name.set('Warrior' if 'Warrior' in self.store['presets'] else next(iter(self.store['presets'])))
-                self.load()
         self.refresh()
         root.bind('<FocusOut>', self.capture_focus_out, add='+')
         root.bind('<Destroy>', lambda event: self.cancel_capture() if event.widget == root else None, add='+')
         root.protocol('WM_DELETE_WINDOW', self.close_manager)
+        if self.store['presets']:
+            self.name.set('Warrior' if 'Warrior' in self.store['presets'] else next(iter(self.store['presets'])))
+            self.load()
+        else:
+            self.read_current()
 
     def close_manager(self):
         if self.busy:
@@ -391,7 +417,12 @@ class App:
 
     def select(self, name):
         if name not in self.store['presets']:
-            self.store['presets'][name] = self.form_values()
+            if not self.store['presets']:
+                self.read_current()
+                return
+            baseline = self.store['presets'].get('Original') or read_bindings(self.settings_path().read_bytes().decode('utf-8-sig'))
+            self.store['presets'][name] = dict(validate(baseline))
+            self.persist()
         self.name.set(name)
         self.load()
 
@@ -422,10 +453,48 @@ class App:
         path = filedialog.askopenfilename(title='Select settings.ron', filetypes=[('RON settings', '*.ron')])
         if path: self.path.set(path); self.read_current()
     def read_current(self):
-        self.fill(read_bindings(self.settings_path().read_bytes().decode('utf-8-sig')))
-        self.name.set('')
-        self.highlight_selection()
-        self.status.set('Current bindings loaded.')
+        path = self.settings_path()
+        if not path.exists():
+            self.status.set('Open Arena of Champions and sign in first, or browse to its settings.ron file. No presets have been created.')
+            return
+        initialise = not self.store['presets']
+        def loaded(snapshot):
+            self.fill(snapshot['bindings'])
+            if initialise:
+                self.data.mkdir(parents=True,exist_ok=True)
+                try:
+                    with (self.data/'original-settings.ron').open('xb') as stream: stream.write(snapshot['local'])
+                except FileExistsError: pass
+                if snapshot['account'] is not None and not (self.data/'original-account-settings.json').exists():
+                    atomic_write(self.data/'original-account-settings.json',json.dumps({'settings':snapshot['account']},indent=2).encode())
+                self.store['presets'] = {name:dict(snapshot['bindings']) for name in ['Original',*CLASSES]}
+                self.name.set('Warrior')
+                self.persist()
+                self.refresh()
+            else:
+                self.name.set('')
+                self.highlight_selection()
+            self.status.set(snapshot['notice'] or ('Current bindings saved for all nine classes.' if initialise else 'Current '+snapshot['source']+' bindings loaded.'))
+        if not any((path.parent/name).exists() for name in ('session.ron','guest.ron')):
+            loaded(read_game_snapshot(path))
+            return
+        self.busy = True
+        self.status.set('Reading your current game bindings…')
+        results = queue.SimpleQueue()
+        def worker():
+            try: results.put((True,read_game_snapshot(path)))
+            except Exception as exc: results.put((False,str(exc)))
+        threading.Thread(target=worker,daemon=True).start()
+        def poll():
+            try: success,result = results.get_nowait()
+            except queue.Empty:
+                self.root.after(80,poll); return
+            self.busy = False
+            if success: self.safe(lambda: loaded(result))
+            else:
+                self.status.set('Could not read the game settings. No presets were created.')
+                messagebox.showerror('Read from game',result,parent=self.root)
+        self.root.after(80,poll)
     def load(self):
         self.fill(self.store['presets'][self.name.get()],self.store['binding_priorities'].get(self.name.get()))
         self.highlight_selection()
@@ -502,7 +571,7 @@ class App:
 
     def start_apply(self, values, restoring=False, game=None, approved=False):
         self.cancel_capture()
-        values = validate(values)
+        values = validate_for_game(values)
         issues = conflicts(self.settings_path().read_bytes().decode('utf-8-sig'),values)
         if issues: raise ValueError('Clear or change duplicate bindings before applying:\n\n'+'\n'.join(issues))
         if not approved:
@@ -699,7 +768,11 @@ if __name__ == '__main__':
         messagebox.showerror('Startup error', str(exc), parent=root); root.destroy(); sys.exit(1)
     if smoke:
         def finish_smoke():
+            if app.busy:
+                root.after(100,finish_smoke)
+                return
             result = {'status': 'ok', 'bindings': app.form_values(), 'presets': list(app.store['presets']),
+                      'initialised': all(name in app.store['presets'] for name in CLASSES),
                       'title': root.title(), 'class_buttons': len(app.preset_buttons),
                       'window': [root.winfo_width(), root.winfo_height()]}
             atomic_write(Path(sys.argv[2]), json.dumps(result, indent=2).encode())

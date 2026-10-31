@@ -1,7 +1,8 @@
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+import time
 import presets
 
 
@@ -88,7 +89,7 @@ class PresetTests(unittest.TestCase):
                 self.assertEqual(token, 'test-session-secret'); calls.append(method)
                 if method == 'PUT': state.update(payload); return {}
                 return dict(state)
-            values = self.modified(); values['action_3']=''; values['class_3']=''
+            values = self.modified()
             presets.apply_synced_bindings(path, values, folder / 'backups', lambda: False, api)
             self.assertEqual(calls, ['GET', 'PUT', 'GET'])
             self.assertEqual(state['settings'], presets.patch_settings(remote, values))
@@ -108,6 +109,72 @@ class PresetTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     presets.apply_synced_bindings(path, self.modified(), folder / 'backups', lambda: False, api)
                 self.assertEqual(path.read_bytes(), self.original)
+
+    def test_empty_binding_is_never_sent_to_the_game_or_account(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary); path=folder/'settings.ron'; path.write_bytes(self.original)
+            values=self.modified(); values['action_3']=''
+            api=Mock()
+            with self.assertRaisesRegex(ValueError,'cannot load empty bindings'):
+                presets.apply_synced_bindings(path,values,folder/'backups',lambda:False,api)
+            api.assert_not_called()
+            self.assertEqual(path.read_bytes(),self.original)
+
+    def test_first_launch_imports_account_bindings_for_every_class_and_keeps_them(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary); game=folder/'game'; game.mkdir()
+            path=game/'settings.ron'; path.write_bytes(self.original)
+            (game/'session.ron').write_text('(token: "fake-session")')
+            custom=self.modified(); remote='(settings:'+presets.patch_settings(self.text,custom).strip()+')'
+            api=Mock(return_value={'settings':remote})
+            with patch.object(presets,'BASE',folder/'app'),patch.object(presets,'DEFAULT_SETTINGS',path),patch.object(presets,'account_api',api):
+                root=presets.tk.Tk()
+                try:
+                    app=presets.App(root)
+                    deadline=time.monotonic()+3
+                    while app.busy and time.monotonic()<deadline:
+                        root.update(); time.sleep(.01)
+                    self.assertFalse(app.busy)
+                    for name in ['Original',*presets.CLASSES]: self.assertEqual(app.store['presets'][name],custom)
+                    self.assertEqual((app.data/'original-settings.ron').read_bytes(),self.original)
+                    self.assertNotIn('fake-session',(app.data/'original-account-settings.json').read_text())
+                    api.assert_called_once_with('GET',None,'fake-session')
+                    app.select('Mage'); app.values['action_1'].set('Alt-KeyB'); app.update()
+                finally: root.destroy()
+                api.reset_mock()
+                path.write_bytes(self.original)
+                root=presets.tk.Tk()
+                try:
+                    app=presets.App(root);root.update()
+                    self.assertEqual(app.store['presets']['Mage']['action_1'],'Alt-KeyB')
+                    self.assertEqual(app.store['presets']['Warrior'],custom)
+                    self.assertEqual((app.data/'original-settings.ron').read_bytes(),self.original)
+                    api.assert_not_called()
+                finally: root.destroy()
+
+    def test_missing_settings_waits_until_a_real_file_is_selected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary); path=folder/'game'/'settings.ron'
+            with patch.object(presets,'BASE',folder/'app'),patch.object(presets,'DEFAULT_SETTINGS',path):
+                root=presets.tk.Tk()
+                try:
+                    app=presets.App(root);root.update();app.select('Mage')
+                    self.assertEqual(app.store['presets'],{})
+                    self.assertFalse(app.store_path.exists())
+                    path.parent.mkdir();path.write_bytes(presets.patch_settings(self.text,self.modified()).encode())
+                    app.read_current()
+                    for name in presets.CLASSES: self.assertEqual(app.store['presets'][name],self.modified())
+                finally:root.destroy()
+
+    def test_reading_offline_preserves_custom_local_bindings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary);path=folder/'settings.ron'
+            path.write_bytes(presets.patch_settings(self.text,self.modified()).encode())
+            (folder/'session.ron').write_text('(token: "fake")')
+            snapshot=presets.read_game_snapshot(path,Mock(side_effect=ValueError('Offline')))
+            self.assertEqual(snapshot['bindings'],self.modified())
+            self.assertEqual(snapshot['source'],'game')
+            self.assertTrue(snapshot['notice'])
 
     def test_remote_conflict_preserves_both_documents(self):
         with tempfile.TemporaryDirectory() as temporary:

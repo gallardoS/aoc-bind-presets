@@ -6,6 +6,8 @@ keybinding preset manager for Arena of Champions
 
 Save a preset for each class and switch between them whenever you need. Works with **Action Bar** and **Beside the Bar**.
 
+On the first launch, the app reads your saved game bindings and copies them to all nine classes. It also keeps a copy of your original settings. Your saved presets are kept on later launches.
+
 ## How to use
 
 1. Select a class.
