@@ -146,4 +146,43 @@ class UpdateTests(unittest.TestCase):
             app.root.destroy.assert_called_once()
 
 
+    def test_bundled_version_text_does_not_shadow_the_windows_dll(self):
+        import sys
+        with tempfile.TemporaryDirectory() as temp:
+            folder=Path(temp);(folder/'VERSION').write_text('1.0.6')
+            original=updates.ctypes.WinDLL
+            def frozen_loader(name,**kwargs):
+                candidate=folder/Path(name).name
+                return original(str(candidate) if candidate.is_file() else name,**kwargs)
+            with patch.object(updates.ctypes,'WinDLL',side_effect=frozen_loader):
+                self.assertGreater(updates.file_version(Path(sys.executable))[0],0)
+
+    def test_download_reports_actual_bytes_and_verifies_before_finishing(self):
+        data=executable();update=updates.find_update(release(data=data),'1.0.6');events=[]
+        with tempfile.TemporaryDirectory() as temp:
+            updates.download_update(update,Path(temp),lambda url:io.BytesIO(data),lambda path:(1,0,10),progress=lambda done,total:events.append((done,total)))
+        self.assertEqual(events[-1],(len(data),len(data)))
+
+    def test_progress_dialog_is_centered_and_does_not_block_installing(self):
+        import presets
+        with tempfile.TemporaryDirectory() as temp,patch.object(presets,'BASE',Path(temp)),patch.object(presets,'DEFAULT_SETTINGS',Path(__file__).parent/'fixtures'/'settings.ron'):
+            root=presets.tk.Tk()
+            try:
+                app=presets.App(root);root.update()
+                controller=updates.UpdateController(app)
+                controller.progress_state=('1.0.8',42,'Downloading… 42%')
+                with patch.object(controller,'idle',return_value=True):controller.show_progress()
+                root.update()
+                self.assertEqual(controller.progress_bar['value'],42)
+                # Test the dialog exclusion without depending on keys held by
+                # the person using the computer while the tests are running.
+                with patch.object(updates.os,'name','posix'):self.assertTrue(controller.idle())
+                self.assertLess(abs(controller.dialog.winfo_rootx()+controller.dialog.winfo_width()/2-root.winfo_rootx()-root.winfo_width()/2),20)
+                controller.report_error('Download interrupted.')
+                self.assertIsNone(controller.dialog)
+                self.assertIn('Download interrupted.',app.status.get())
+                self.assertIn('Download interrupted.',(app.data/'update-error.log').read_text())
+            finally:root.destroy()
+
+
 if __name__=='__main__':unittest.main(verbosity=2)

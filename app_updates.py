@@ -17,6 +17,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import tkinter as tk
+from tkinter import ttk
 
 REPOSITORY='gallardoS/aoc-bind-presets'
 LATEST_URL=f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
@@ -103,7 +105,9 @@ def file_hash(path):
 
 
 def file_version(path):
-    api=ctypes.WinDLL('version',use_last_error=True)
+    # Spell out the DLL extension: PyInstaller otherwise finds the bundled
+    # VERSION text file first on Windows' case-insensitive filesystem.
+    api=ctypes.WinDLL('version.dll',use_last_error=True)
     api.GetFileVersionInfoSizeW.argtypes=[w.LPCWSTR,ctypes.POINTER(w.DWORD)]
     api.GetFileVersionInfoW.argtypes=[w.LPCWSTR,w.DWORD,w.DWORD,w.LPVOID]
     api.VerQueryValueW.argtypes=[w.LPCVOID,w.LPCWSTR,ctypes.POINTER(ctypes.c_void_p),ctypes.POINTER(w.UINT)]
@@ -131,7 +135,7 @@ def verify_executable(path,expected_hash,version,read_version=file_version):
     if tuple(read_version(path))!=version_tuple(version):raise ValueError('The download does not match the release version.')
 
 
-def download_update(update,directory,fetch=open_url,read_version=file_version):
+def download_update(update,directory,fetch=open_url,read_version=file_version,progress=None):
     expected=update.sha256
     if expected is None:
         with fetch(update.checksum_url) as response:raw=response.read(65537)
@@ -149,6 +153,7 @@ def download_update(update,directory,fetch=open_url,read_version=file_version):
                 if received>update.size or received>MAX_DOWNLOAD or time.monotonic()-started>180:
                     raise ValueError('Unexpected update download size or duration.')
                 stream.write(chunk)
+                if progress:progress(received,update.size)
             stream.flush();os.fsync(stream.fileno())
         if received!=update.size:raise ValueError('The update download is incomplete.')
         verify_executable(destination,expected,update.version,read_version)
@@ -243,11 +248,12 @@ def cleanup_stage(stage,base):
 class UpdateController:
     def __init__(self,app):
         self.app=app;self.root=app.root;self.results=queue.SimpleQueue();self.pending=None;self.draft_restored=False
+        self.dialog=None;self.progress_state=None
 
     def idle(self):
         app=self.app
         if app.busy or app.capture_state or self.root.grab_current() is not None:return False
-        if any(child.winfo_viewable() and not child.overrideredirect() for child in self.root.winfo_children() if child.winfo_class()=='Toplevel'):return False
+        if any(child is not self.dialog and child.winfo_viewable() and not child.overrideredirect() for child in self.root.winfo_children() if child.winfo_class()=='Toplevel'):return False
         if os.name=='nt':
             user=ctypes.WinDLL('user32')
             user.GetAncestor.argtypes=[w.HWND,w.UINT];user.GetAncestor.restype=w.HWND
@@ -257,27 +263,76 @@ class UpdateController:
         return True
 
     def start(self,check=True,cleanup=None):
+        self.record_status('checking' if check else 'check-disabled')
         if cleanup:self.root.after(2500,lambda:cleanup_stage(cleanup,self.app.data.parent))
         self.root.after(150,self.restore_draft)
         if not check:return
         def worker():
             stage=None
             try:
-                update=find_update(latest_release(),current_version())
+                installed=current_version();release=latest_release()
+                self.record_status('checked',installed=installed,latest=release.get('tag_name'))
+                update=find_update(release,installed)
                 if update is None:self.results.put(('done',None));return
                 self.results.put(('downloading',update.version))
                 stage=Path(tempfile.mkdtemp(prefix='.aoc-update-',dir=self.app.data.parent))
-                _,digest=download_update(update,stage)
+                _,digest=download_update(update,stage,progress=lambda done,total:self.results.put(('progress',(done,total))))
                 self.results.put(('ready',(stage,update.version,digest)))
-            except Exception:
+            except Exception as exc:
                 if stage:
                     try:
                         (stage/'candidate.exe').unlink(missing_ok=True)
                         stage.rmdir()
                     except OSError:pass
-                self.results.put(('error',None))
+                self.results.put(('error',str(exc)))
         threading.Thread(target=worker,daemon=True).start()
         self.root.after(150,self.poll)
+
+    def record_status(self,phase,**details):
+        try:
+            self.app.data.mkdir(parents=True,exist_ok=True)
+            (self.app.data/'update-status.json').write_text(json.dumps({'phase':phase,**details}),encoding='utf-8')
+        except OSError:pass
+
+    def show_progress(self):
+        if not self.progress_state or not self.idle():return
+        if self.dialog is None:
+            dialog=tk.Toplevel(self.root);dialog.withdraw();dialog.title('Updating AoC-bind-presets')
+            dialog.transient(self.root);dialog.resizable(False,False);dialog.configure(bg='#0d1217')
+            dialog.protocol('WM_DELETE_WINDOW',lambda:None)
+            panel=ttk.Frame(dialog,padding=24);panel.pack(fill='both',expand=True)
+            self.update_heading=ttk.Label(panel,style='Heading.TLabel');self.update_heading.pack(anchor='w',pady=(0,14))
+            self.progress_bar=ttk.Progressbar(panel,length=380,maximum=100,mode='determinate',style='Update.Horizontal.TProgressbar')
+            ttk.Style(self.root).configure('Update.Horizontal.TProgressbar',background='#bfa140',troughcolor='#211c13',bordercolor='#8e7135',lightcolor='#e8ca65',darkcolor='#6e541b',thickness=18)
+            self.progress_bar.pack(fill='x')
+            self.update_detail=ttk.Label(panel);self.update_detail.pack(anchor='w',pady=(10,0))
+            self.root.update_idletasks();dialog.update_idletasks()
+            x=self.root.winfo_rootx()+(self.root.winfo_width()-dialog.winfo_reqwidth())//2
+            y=self.root.winfo_rooty()+(self.root.winfo_height()-dialog.winfo_reqheight())//2
+            dialog.geometry(f'+{max(0,x)}+{max(0,y)}');dialog.deiconify()
+            if os.name=='nt':
+                user=ctypes.WinDLL('user32')
+                user.GetAncestor.argtypes=[w.HWND,w.UINT];user.GetAncestor.restype=w.HWND
+                user.SetWindowPos.argtypes=[w.HWND,w.HWND,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,w.UINT]
+                user.SetWindowPos(user.GetAncestor(dialog.winfo_id(),2),None,x,y,0,0,0x15)
+            self.dialog=dialog
+        version,percent,detail=self.progress_state
+        self.update_heading.configure(text='Updating to v'+version+'…')
+        self.progress_bar['value']=percent
+        self.update_detail.configure(text=detail)
+
+    def close_progress(self):
+        if self.dialog is not None:self.dialog.destroy();self.dialog=None
+        self.progress_state=None
+
+    def report_error(self,message):
+        self.record_status('error',message=message)
+        self.close_progress()
+        self.app.status.set('Could not update automatically. '+message)
+        try:
+            self.app.data.mkdir(parents=True,exist_ok=True)
+            (self.app.data/'update-error.log').write_text(time.strftime('%Y-%m-%d %H:%M:%S')+' '+message+'\n',encoding='utf-8')
+        except OSError:pass
 
     def restore_draft(self):
         if not self.idle():self.root.after(150,self.restore_draft);return
@@ -302,11 +357,19 @@ class UpdateController:
                 kind,value=self.results.get_nowait()
                 if kind=='done':return
                 if kind=='error':
-                    if self.idle():self.app.status.set('Could not check for updates. You can keep using the app.')
+                    self.report_error(value or 'Please try again later.')
                     return
-                if kind=='downloading' and self.idle():self.app.status.set('Downloading update v'+value+'…')
-                if kind=='ready':self.pending=value
+                if kind=='downloading':
+                    self.progress_state=(value,0,'Downloading… 0%')
+                    self.app.status.set('Downloading update v'+value+'…')
+                if kind=='progress' and self.progress_state:
+                    done,total=value;percent=min(100,int(done*100/total))
+                    self.progress_state=(self.progress_state[0],percent,'Verifying download…' if done==total else f'Downloading… {percent}%')
+                if kind=='ready':
+                    self.pending=value
+                    self.progress_state=(value[1],100,'Download verified. Preparing to restart…')
         except queue.Empty:pass
+        self.show_progress()
         if self.pending and self.draft_restored and self.idle():
             stage,version,digest=self.pending
             try:
@@ -318,8 +381,8 @@ class UpdateController:
                 prepare_install(Path(sys.executable),stage,version,digest)
                 self.root.destroy()
                 return
-            except Exception:
+            except Exception as exc:
                 (self.app.data/'update-draft.json').unlink(missing_ok=True)
-                self.app.busy=False;self.app.status.set('Could not install the update. You can keep using the app.')
+                self.app.busy=False;self.report_error(str(exc))
                 return
         self.root.after(150,self.poll)
