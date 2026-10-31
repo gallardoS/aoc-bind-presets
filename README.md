@@ -4,13 +4,13 @@ keybinding preset manager for Arena of Champions
 
 ![AoC-bind-presets](docs/screenshot.png)
 
-Save a preset for each class and switch between them whenever you need. Edit the bindings found in your game settings: **Movement**, **Targeting**, **Action Bar**, **Beside the Bar**, **Camera**, and **Interface**.
+Save a preset for each specialization and switch between them whenever you need. Each class has three specialization buttons with WoW Classic icons. Edit the bindings found in your game settings: **Movement**, **Targeting**, **Action Bar**, **Beside the Bar**, **Camera**, and **Interface**.
 
-On the first launch, the app reads your saved game bindings and copies them to all nine classes. It also keeps a copy of your original settings. Your saved presets are kept on later launches. New bindings appear automatically when you open the app or click **Read from game**. Unfamiliar controls appear under **Other**. Existing presets keep your choices and add new bindings from the game. A backup is saved before updating them.
+On the first launch, the app reads your saved game bindings and copies them to every specialization. Existing class presets are copied to their three specializations, with a backup kept before the change. It also keeps a copy of your original settings. Your saved presets are kept on later launches. New bindings appear automatically when you open the app or click **Read from game**. Unfamiliar controls appear under **Other**. Existing presets keep your choices and add new bindings from the game. A backup is saved before updating them.
 
 ## How to use
 
-1. Select a class.
+1. Select a class, then a specialization.
 2. Click a binding and press a key or mouse button. Use the trash icon to clear it.
 3. Click **Save**, then **Apply preset**.
 

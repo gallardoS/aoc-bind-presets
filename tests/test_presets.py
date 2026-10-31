@@ -145,7 +145,7 @@ class PresetTests(unittest.TestCase):
                     while app.busy and time.monotonic()<deadline:
                         root.update(); time.sleep(.01)
                     self.assertFalse(app.busy)
-                    for name in ['Original',*presets.CLASSES]: self.assertEqual(app.store['presets'][name],custom)
+                    for name in ['Original',*presets.CLASSES,*presets.SPEC_PRESETS]: self.assertEqual(app.store['presets'][name],custom)
                     self.assertEqual((app.data/'original-settings.ron').read_bytes(),self.original)
                     self.assertNotIn('fake-session',(app.data/'original-account-settings.json').read_text())
                     api.assert_called_once_with('GET',None,'fake-session')
@@ -156,7 +156,7 @@ class PresetTests(unittest.TestCase):
                 root=presets.tk.Tk()
                 try:
                     app=presets.App(root);root.update()
-                    self.assertEqual(app.store['presets']['Mage']['action_1'],'Alt-KeyB')
+                    self.assertEqual(app.store['presets']['Mage - Arcane']['action_1'],'Alt-KeyB')
                     self.assertEqual(app.store['presets']['Warrior'],custom)
                     self.assertEqual((app.data/'original-settings.ron').read_bytes(),self.original)
                     api.assert_not_called()
@@ -244,14 +244,14 @@ class PresetTests(unittest.TestCase):
             try:
                 app = presets.App(root); root.update()
                 self.assertEqual(presets.DEFAULT_SETTINGS.read_bytes(), self.original)
-                self.assertEqual(set(app.store['presets']), {'Original', *presets.CLASSES})
+                self.assertEqual(set(app.store['presets']), {'Original', *presets.CLASSES, *presets.SPEC_PRESETS})
                 self.assertEqual(root.title(), 'AoC-bind-presets')
                 self.assertEqual(list(app.preset_buttons), ['Warrior', 'Mage', 'Priest', 'Rogue', 'Hunter', 'Paladin', 'Warlock', 'Druid', 'Shaman'])
                 self.assertEqual(app.form_values(), presets.read_bindings(self.text))
                 self.assertEqual(set(app.binding_entries),presets.FIELD_KEYS)
-                app.store['presets']['Mage']['action_1'] = 'Ctrl-KeyQ'
+                app.store['presets']['Mage - Arcane']['action_1'] = 'Ctrl-KeyQ'
                 app.preset_buttons['Mage'].invoke()
-                self.assertEqual(app.name.get(), 'Mage')
+                self.assertEqual(app.name.get(), 'Mage - Arcane')
                 self.assertEqual(app.values['action_1'].get(), 'Ctrl-KeyQ')
                 self.assertEqual(presets.DEFAULT_SETTINGS.read_bytes(), self.original)
                 clipped = []
@@ -308,7 +308,7 @@ class PresetTests(unittest.TestCase):
                 self.assertEqual(app.values['action_3'].get(),previous)
                 app.update()
                 saved = __import__('json').loads(app.store_path.read_text())
-                self.assertEqual(saved['presets']['Mage']['action_1'],'')
+                self.assertEqual(saved['presets']['Mage - Arcane']['action_1'],'')
                 self.assertEqual(presets.DEFAULT_SETTINGS.read_bytes(), self.original)
             finally: root.destroy()
 

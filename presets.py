@@ -25,6 +25,37 @@ BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__
 DEFAULT_SETTINGS = Path(os.environ.get('APPDATA', str(Path.home()))) / 'arena-of-champions' / 'settings.ron'
 RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 CLASSES = ['Warrior', 'Mage', 'Priest', 'Rogue', 'Hunter', 'Paladin', 'Warlock', 'Druid', 'Shaman']
+SPECIALIZATIONS = {
+    'Warrior': [('Arms', 'ability_warrior_savageblow'), ('Fury', 'ability_warrior_innerrage'), ('Protection', 'ability_warrior_defensivestance')],
+    'Mage': [('Arcane', 'spell_holy_magicalsentry'), ('Fire', 'spell_fire_firebolt02'), ('Frost', 'spell_frost_frostbolt02')],
+    'Priest': [('Discipline', 'spell_holy_powerwordshield'), ('Holy', 'spell_holy_holybolt'), ('Shadow', 'spell_shadow_shadowwordpain')],
+    'Rogue': [('Assassination', 'ability_rogue_eviscerate'), ('Combat', 'ability_backstab'), ('Subtlety', 'ability_stealth')],
+    'Hunter': [('Beast Mastery', 'ability_hunter_beasttaming'), ('Marksmanship', 'ability_marksmanship'), ('Survival', 'ability_hunter_swiftstrike')],
+    'Paladin': [('Holy', 'spell_holy_holybolt'), ('Protection', 'spell_holy_devotionaura'), ('Retribution', 'spell_holy_auraoflight')],
+    'Warlock': [('Affliction', 'spell_shadow_deathcoil'), ('Demonology', 'spell_shadow_metamorphosis'), ('Destruction', 'spell_shadow_rainoffire')],
+    'Druid': [('Balance', 'spell_nature_starfall'), ('Restoration', 'spell_nature_healingtouch'), ('Feral', 'ability_druid_catform')],
+    'Shaman': [('Elemental', 'spell_nature_lightning'), ('Enhancement', 'spell_nature_lightningshield'), ('Restoration', 'spell_nature_magicimmunity')],
+}
+SPEC_PRESETS = [f'{name} - {spec}' for name in CLASSES for spec, _ in SPECIALIZATIONS[name]]
+
+
+def add_specialization_presets(store):
+    """Seed missing specializations from their class without changing saved presets."""
+    if not store['presets']: return False
+    changed = False
+    priorities = store.setdefault('binding_priorities', {})
+    for name in CLASSES:
+        baseline = store['presets'].get(name, store['presets'].get('Original'))
+        if baseline is None: continue
+        for spec, _ in SPECIALIZATIONS[name]:
+            key = f'{name} - {spec}'
+            if key not in store['presets']:
+                store['presets'][key] = dict(baseline)
+                priorities[key] = dict(priorities.get(name, {}))
+                changed = True
+    return changed
+
+
 # These are display labels and category hints, not a required binding schema.
 # Every editable row is discovered from the selected settings file.
 ACTION_FIELDS = [(f'action_{i+1}', f'Action {i+1}') for i in range(8)]
@@ -313,6 +344,13 @@ class App:
             saved = json.loads(self.store_path.read_text(encoding='utf-8'))
             self.store = {key: saved[key] for key in ('version', 'settings_path', 'presets', 'binding_priorities') if key in saved}
             if self.store.get('version') not in (1,2,3): raise ValueError('Unsupported presets version.')
+        if add_specialization_presets(self.store):
+            if self.store_path.exists():
+                stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+                atomic_write(self.data/'backups'/(stamp+'-presets.json'), self.store_path.read_bytes())
+            atomic_write(self.store_path, json.dumps(self.store, indent=2, ensure_ascii=False).encode('utf-8'))
+        self.active_class = 'Warrior'
+        self.last_specialization = {}
         self.path = tk.StringVar(value=self.store.get('settings_path', str(DEFAULT_SETTINGS)))
         self.document=None
         self.schema=None
@@ -343,7 +381,10 @@ class App:
         self.selected_label = tk.StringVar(value='Current bindings')
         self.store.setdefault('binding_priorities', {})
         self.icons = {name: tk.PhotoImage(file=str(RESOURCES / 'icons' / (name.lower() + '.png'))).zoom(3, 3).subsample(4, 4) for name in CLASSES}
+        self.spec_icons = {icon: tk.PhotoImage(file=str(RESOURCES/'icons'/'specializations'/(icon+'.png'))).zoom(3,3).subsample(4,4)
+                           for specs in SPECIALIZATIONS.values() for name,icon in specs}
         self.preset_buttons = {}
+        self.spec_buttons = {}
         root.title('AoC-bind-presets')
         root.iconbitmap(default=str(RESOURCES / 'icons' / 'app.ico'))
         window_width=min(1180,root.winfo_screenwidth()-60)
@@ -373,6 +414,8 @@ class App:
         ttk.Label(presets, textvariable=self.selected_label, style='Heading.TLabel').pack(side='left', fill='x', expand=True)
         for label, command in [('Save to…', self.save_as), ('Save', self.update), ('Reset', self.delete)]:
             ttk.Button(presets, text=label, command=lambda f=command: self.safe(f)).pack(side='left', padx=(8, 0))
+        self.spec_bar = ttk.Frame(content)
+        self.spec_bar.pack(fill='x', pady=(0,14))
         controls = ttk.Frame(content); controls.pack(fill='both',expand=True)
         self.bindings_canvas = tk.Canvas(controls,bg='#0d1217',highlightthickness=0)
         self.bindings_canvas.pack(side='left',fill='both',expand=True)
@@ -394,8 +437,7 @@ class App:
         root.bind('<Destroy>', lambda event: self.cancel_capture() if event.widget == root else None, add='+')
         root.protocol('WM_DELETE_WINDOW', self.close_manager)
         if self.field_keys and self.store['presets'] and not self.needs_upgrade():
-            self.name.set('Warrior' if 'Warrior' in self.store['presets'] else next(iter(self.store['presets'])))
-            self.load()
+            self.select('Warrior')
         else:
             self.read_current()
 
@@ -503,16 +545,45 @@ class App:
             button.bind('<MouseWheel>', lambda e: self.preset_canvas.yview_scroll(-int(e.delta / 120), 'units'))
             self.add_tooltip(button, name)
             self.preset_buttons[name] = button
+        self.render_specializations()
         self.highlight_selection()
 
+    def render_specializations(self):
+        for child in self.spec_bar.winfo_children(): child.destroy()
+        self.spec_buttons.clear()
+        for spec, icon in SPECIALIZATIONS[self.active_class]:
+            name = f'{self.active_class} - {spec}'
+            button = tk.Button(self.spec_bar, image=self.spec_icons[icon],
+                               bg='#211c13', activebackground='#3b3019', relief='flat',
+                               borderwidth=0, highlightthickness=2, highlightbackground='#8e7135',
+                               highlightcolor='#ffd100', cursor='hand2', takefocus=True,
+                               command=lambda n=name: self.safe(lambda: self.select(n)))
+            button.pack(side='left', padx=(0,10), ipadx=3, ipady=2)
+            self.add_tooltip(button, spec)
+            self.spec_buttons[name] = button
+
     def highlight_selection(self):
+        selected_name = self.name.get()
+        selected_class = selected_name.split(' - ',1)[0]
+        if selected_name in SPEC_PRESETS:
+            self.last_specialization[selected_class] = selected_name
+        if selected_class in CLASSES and selected_class != self.active_class:
+            self.active_class = selected_class
+            self.render_specializations()
         for name, button in self.preset_buttons.items():
-            selected = name == self.name.get()
+            selected = name == selected_class
             button.configure(bg='#493a17' if selected else '#211c13',
                              highlightbackground='#ffd100' if selected else '#8e7135')
-        self.selected_label.set(self.name.get() or 'Current bindings')
+        for name, button in self.spec_buttons.items():
+            selected = name == selected_name
+            button.configure(bg='#493a17' if selected else '#211c13',
+                             highlightbackground='#ffd100' if selected else '#8e7135')
+        self.selected_label.set(selected_name or 'Current bindings')
 
     def select(self, name):
+        if name in CLASSES:
+            name = self.last_specialization.get(name, f'{name} - {SPECIALIZATIONS[name][0][0]}')
+        if name not in SPEC_PRESETS: return
         if not self.schema:
             self.read_current();return
         if name not in self.store['presets']:
@@ -522,6 +593,7 @@ class App:
             baseline = self.store['presets'].get('Original') or read_bindings(self.settings_path().read_bytes().decode('utf-8-sig'))
             self.store['presets'][name] = dict(validate(baseline))
             self.persist()
+        self.last_specialization[name.split(' - ',1)[0]] = name
         self.name.set(name)
         self.load()
 
@@ -569,8 +641,9 @@ class App:
                 if snapshot['account'] is not None and not (self.data/'original-account-settings.json').exists():
                     atomic_write(self.data/'original-account-settings.json',json.dumps({'settings':snapshot['account']},indent=2).encode())
                 self.store['presets'] = {name:dict(snapshot['bindings']) for name in ['Original',*CLASSES]}
+                add_specialization_presets(self.store)
                 self.store['version'] = 3
-                self.name.set('Warrior')
+                self.name.set(SPEC_PRESETS[0])
                 self.persist()
                 self.refresh()
             elif upgrading:
@@ -579,14 +652,15 @@ class App:
                     stamp=datetime.now().strftime('%Y%m%d-%H%M%S-%f')
                     atomic_write(self.data/'backups'/(stamp+'-presets.json'),self.store_path.read_bytes())
                 self.store['presets']=upgraded
+                add_specialization_presets(self.store)
                 self.store['version']=3
                 self.persist()
-                self.name.set('Warrior' if 'Warrior' in upgraded else next(iter(upgraded)))
+                self.name.set(SPEC_PRESETS[0])
                 self.load();self.refresh()
             else:
                 self.name.set('')
                 self.highlight_selection()
-            self.status.set(snapshot['notice'] or ('Your presets now include all game bindings.' if upgrading else 'Current bindings saved for all nine classes.' if initialise else f"{len(snapshot['bindings'])} current {snapshot['source']} bindings loaded."))
+            self.status.set(snapshot['notice'] or ('Your presets now include all game bindings.' if upgrading else 'Current bindings saved for every specialization.' if initialise else f"{len(snapshot['bindings'])} current {snapshot['source']} bindings loaded."))
         if not any((path.parent/name).exists() for name in ('session.ron','guest.ron')):
             loaded(read_game_snapshot(path))
             return
@@ -613,16 +687,16 @@ class App:
         self.status.set('')
     def save_as(self):
         values = self.form_values()
-        dialog = tk.Toplevel(self.root); dialog.withdraw(); dialog.title('Save to class'); dialog.transient(self.root)
+        dialog = tk.Toplevel(self.root); dialog.withdraw(); dialog.title('Save to specialization'); dialog.transient(self.root)
         dialog.configure(bg='#0d1217'); dialog.resizable(False, False)
         panel = ttk.Frame(dialog, padding=22); panel.pack()
-        name_var = tk.StringVar(value=self.name.get() if self.name.get() in CLASSES else 'Warrior')
-        ttk.Label(panel, text='Class').grid(row=0, column=0, sticky='w', pady=8, padx=(0, 15))
-        entry = ttk.Combobox(panel, textvariable=name_var, values=CLASSES, state='readonly', width=26)
+        name_var = tk.StringVar(value=self.name.get() if self.name.get() in SPEC_PRESETS else SPEC_PRESETS[0])
+        ttk.Label(panel, text='Specialization').grid(row=0, column=0, sticky='w', pady=8, padx=(0, 15))
+        entry = ttk.Combobox(panel, textvariable=name_var, values=SPEC_PRESETS, state='readonly', width=30)
         entry.grid(row=0, column=1)
         def save():
             name = name_var.get().strip()
-            if name not in CLASSES: return
+            if name not in SPEC_PRESETS: return
             if name in self.store['presets'] and not messagebox.askyesno('Replace preset', f'Replace "{name}"?', parent=dialog): return
             self.store['presets'][name] = values
             self.store['binding_priorities'][name] = dict(self.edit_order)
@@ -641,7 +715,7 @@ class App:
         self.status.set(f'Preset "{name}" saved.')
     def delete(self):
         name = self.name.get()
-        if name in CLASSES and messagebox.askyesno('Reset preset', f'Reset "{name}" to the original bindings?', parent=self.root):
+        if name in SPEC_PRESETS and messagebox.askyesno('Reset preset', f'Reset "{name}" to the original bindings?', parent=self.root):
             original = self.store['presets'].get('Original')
             if original is None:
                 original = read_bindings(self.settings_path().read_bytes().decode('utf-8-sig'))
@@ -727,7 +801,7 @@ class App:
         self.fill(complete_bindings(payload['bindings'],self.form_values()))
         self.name.set('')
         self.highlight_selection()
-        self.status.set('Preset imported. Use Save to to choose its class.')
+        self.status.set('Preset imported. Use Save to to choose its specialization.')
     def export_preset(self):
         values = self.form_values()
         path = filedialog.asksaveasfilename(parent=self.root,defaultextension='.json', initialfile=(self.name.get() or 'preset') + '.json', filetypes=[('Preset JSON', '*.json')])

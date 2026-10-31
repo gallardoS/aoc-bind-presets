@@ -91,8 +91,8 @@ class SchemaTests(unittest.TestCase):
                     app.read_current();root.update()
                     self.assertEqual(len(app.binding_entries),35)
                     self.assertIn('interrupt_focus',app.binding_entries)
-                    self.assertEqual(app.store['presets']['Mage']['action_1'],'Ctrl-KeyQ')
-                    self.assertEqual(app.store['presets']['Mage']['action_10'],'F16')
+                    self.assertEqual(app.store['presets']['Mage - Arcane']['action_1'],'Ctrl-KeyQ')
+                    self.assertEqual(app.store['presets']['Mage - Arcane']['action_10'],'F16')
                     backups=[p.read_bytes() for p in (app.data/'backups').glob('*-presets.json')]
                     self.assertIn(saved,backups)
                     app.values['interrupt_focus'].set('KeyF')
@@ -101,7 +101,7 @@ class SchemaTests(unittest.TestCase):
                     app.read_current();root.update()
                     self.assertEqual(len(app.binding_entries),29)
                     self.assertNotIn('interrupt_focus',app.values)
-                    self.assertEqual(app.store['presets']['Mage']['action_1'],'Ctrl-KeyQ')
+                    self.assertEqual(app.store['presets']['Mage - Arcane']['action_1'],'Ctrl-KeyQ')
                 finally:root.destroy()
 
     def test_old_account_does_not_hide_new_bindings_from_the_game_file(self):
