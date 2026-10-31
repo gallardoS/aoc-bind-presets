@@ -20,6 +20,7 @@ from tkinter import ttk, messagebox, filedialog
 from restart_game import running_game, apply_with_restart
 from wc3_theme import install as install_wc3_theme
 from binding_schema import Schema, patch_document, label_for
+from app_updates import current_version
 
 BASE = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 DEFAULT_SETTINGS = Path(os.environ.get('APPDATA', str(Path.home()))) / 'arena-of-champions' / 'settings.ron'
@@ -394,7 +395,11 @@ class App:
         install_wc3_theme(root,RESOURCES)
         outer = ttk.Frame(root,style='Window.TFrame',padding=(34,30,34,28))
         outer.pack(fill='both',expand=True)
-        ttk.Label(outer,text='AoC-bind-presets',style='Title.TLabel',anchor='center').pack(fill='x',pady=(0,14))
+        title = ttk.Frame(outer)
+        title.pack(pady=(0,14))
+        ttk.Label(title,text='AoC-bind-presets',style='Title.TLabel').grid(row=0,column=0)
+        self.version_label = ttk.Label(title,text='v'+current_version(),foreground='#777a7d',font=('Georgia',10))
+        self.version_label.grid(row=0,column=1,sticky='s',padx=(10,0),pady=(0,6))
         location = ttk.Frame(outer); location.pack(fill='x')
         ttk.Entry(location, textvariable=self.path).pack(side='left', fill='x', expand=True)
         ttk.Button(location, text='Browse settings.ron', command=lambda: self.safe(self.browse)).pack(side='left', padx=(8, 0))
