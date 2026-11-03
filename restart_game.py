@@ -84,9 +84,10 @@ class GameProcess:
 def running_game(): return GameProcess().running()
 
 
-def apply_with_restart(path,values,backup_dir,game,apply_settings,backend=None):
+def apply_with_restart(path,values,backup_dir,game,apply_settings,backend=None,preflight=None):
     backend = backend or (GameProcess() if game else None)
     if not game: return apply_settings(path,values,backup_dir),False
+    if preflight: preflight(path)
     backend.close(game)
     try: backup = apply_settings(path,values,backup_dir)
     except Exception as exc:

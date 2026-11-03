@@ -248,14 +248,21 @@ def account_api(method, payload, token):
         'https://arenaofchampions.live/api/settings',
         data=json.dumps(payload).encode('utf-8') if payload is not None else None,
         headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json',
+                 'User-Agent': 'AoC-bind-presets/' + current_version() + ' (+https://github.com/gallardoS/aoc-bind-presets)',
                  'Content-Type': 'application/json'}, method=method)
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             raw = response.read(2_000_000)
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
+        # A protection-layer rejection is not an expired game session.
+        body = exc.read(65536).decode('utf-8', errors='replace').lower()
+        if ('cloudflare' in body and any(marker in body for marker in ('cloudflare_error', 'error 1010', 'error 1020', 'cf-error-details', 'attention required'))) or (exc.headers and exc.headers.get('cf-mitigated') == 'challenge'):
+            raise ValueError('Cloudflare blocked access to the game server. Signing in again will not fix this. The preset was not applied.') from None
+        if exc.code == 401:
             raise ValueError('Your game session has expired. Sign in to the game, close it, then apply again.') from None
+        if exc.code == 403:
+            raise ValueError('The game server denied access (HTTP 403). This does not necessarily mean your session has expired.') from None
         raise ValueError(f'The game server rejected the settings request (HTTP {exc.code}).') from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise ValueError('Could not reach the game server. Check your connection and try again.') from None
@@ -269,6 +276,21 @@ def session_token(path):
     match = re.search(r'\btoken\s*:\s*"([^"\r\n]+)"',session)
     if not match: raise ValueError('The saved game session is not recognized. Sign in to the game again.')
     return match.group(1)
+
+
+def read_account_settings(path, api=None):
+    token = session_token(path)
+    if not token:
+        raise ValueError('No game session found. Sign in to the game, close it, then apply again.')
+    response = (api or account_api)('GET', None, token)
+    remote = response.get('settings') if isinstance(response, dict) else None
+    if not isinstance(remote, str):
+        raise ValueError('No saved account settings found. Change a setting in the game, close it, then apply again.')
+    return token, remote
+
+
+def check_account_access(path):
+    read_account_settings(path)
 
 
 def read_game_snapshot(path, api=None):
@@ -296,13 +318,7 @@ def apply_synced_bindings(path, values, backup_dir, check_game=game_running, api
     if check_game(): raise ValueError('Close Arena of Champions before applying a preset.')
     before = path.read_bytes()
     local = before.decode('utf-8-sig')
-    token = session_token(path)
-    if not token:
-        raise ValueError('No game session found. Sign in to the game, close it, then apply again.')
-    response = api('GET', None, token)
-    remote = response.get('settings') if isinstance(response, dict) else None
-    if not isinstance(remote, str):
-        raise ValueError('No saved account settings found. Change a setting in the game, close it, then apply again.')
+    token, remote = read_account_settings(path, api)
     combined=patch_settings(local,read_bindings(remote),template=remote)
     issues=conflicts(local,values,template=combined)
     if issues:raise ValueError('Duplicate bindings:\n\n'+'\n'.join(issues))
@@ -774,7 +790,7 @@ class App:
         self.status.set('Restarting the game and applying bindings…' if game else 'Updating account and local bindings…')
         results = queue.SimpleQueue()
         def worker():
-            try: results.put((True, apply_with_restart(path,values,self.data/'backups',game,apply_synced_bindings)))
+            try: results.put((True, apply_with_restart(path,values,self.data/'backups',game,apply_synced_bindings,preflight=check_account_access)))
             except Exception as exc: results.put((False, str(exc)))
         threading.Thread(target=worker, daemon=True).start()
         def poll():
