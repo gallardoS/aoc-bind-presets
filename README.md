@@ -14,7 +14,7 @@ On the first launch, the app reads your saved game bindings and copies them to e
 2. Click a binding and press a key or mouse button. Use the trash icon to clear it.
 3. Click **Save**, then **Apply preset**.
 
-If the game is open, you can accept or cancel its restart. Duplicate bindings turn red. Use **Restore bindings** to recover a backup.
+If the game is open, you can accept or cancel its restart. Assigning a binding already in use swaps the two actions. The previous action is highlighted in yellow for three seconds. Conflicts in imported presets still turn red. Use **Restore bindings** to recover a backup.
 
 ## Download
 

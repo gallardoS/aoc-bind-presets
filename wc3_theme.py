@@ -31,6 +31,7 @@ def install(root, resources):
     style.configure('Title.TLabel',font=('Georgia',24,'bold'),foreground=GOLD,anchor='center')
     style.configure('Heading.TLabel',font=('Georgia',13,'bold'),foreground=GOLD)
     style.configure('Conflict.TLabel',foreground='#ff7373')
+    style.configure('Swapped.TLabel',foreground='#ffe27a')
     style.configure('TSeparator',background=BORDER)
     separator = tk.PhotoImage(master=root,width=4,height=2)
     separator.put(BORDER,to=(0,0,4,1)); separator.put('#302819',to=(0,1,4,2))
@@ -59,7 +60,7 @@ def install(root, resources):
     style.map('TButton',foreground=[('disabled','#7c7254'),('active','#ffe86a')])
     style.configure('TEntry',fieldbackground=FIELD,foreground=GOLD,insertcolor=GOLD,padding=6,
                     bordercolor=BORDER,lightcolor='#514326',darkcolor='#080a09',font=('Georgia',10,'bold'))
-    for name,color,text in [('Binding',FIELD,GOLD),('Listening',SELECTED,'#fff0a0'),('Conflict','#3b181c','#ff7373')]:
+    for name,color,text in [('Binding',FIELD,GOLD),('Listening',SELECTED,'#fff0a0'),('Conflict','#3b181c','#ff7373'),('Swapped','#433712','#ffe27a')]:
         style.configure(name+'.TEntry',padding=3,borderwidth=0,relief='flat',font=('Georgia',10,'bold'))
         style.map(name+'.TEntry',fieldbackground=[('readonly',color)],foreground=[('readonly',text)],bordercolor=[('readonly',color)],lightcolor=[('readonly',color)],darkcolor=[('readonly',color)])
     style.configure('TCombobox',fieldbackground=FIELD,foreground=GOLD,background=FIELD,arrowcolor=GOLD,padding=5,bordercolor=BORDER)

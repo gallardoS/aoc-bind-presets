@@ -389,6 +389,7 @@ class App:
         self.edit_counter = 0
         self.loading_bindings = False
         self.conflict_fields = set()
+        self.swap_timers = {}
         self.capture_state = None
         self.busy = False
         self.restart_dialog = None
@@ -455,7 +456,7 @@ class App:
         ttk.Button(bottom, text='Apply preset', command=lambda: self.safe(self.apply)).pack(side='right')
         self.refresh()
         root.bind('<FocusOut>', self.capture_focus_out, add='+')
-        root.bind('<Destroy>', lambda event: self.cancel_capture() if event.widget == root else None, add='+')
+        root.bind('<Destroy>', lambda event: (self.cancel_capture(),self.clear_swap_highlights(refresh=False)) if event.widget == root else None, add='+')
         root.protocol('WM_DELETE_WINDOW', self.close_manager)
         if self.field_keys and self.store['presets'] and not self.needs_upgrade():
             self.select('Warrior')
@@ -486,6 +487,7 @@ class App:
         keys=set(schema.bindings)
         self.document=document;self.schema=schema
         if keys==self.field_keys:return
+        self.clear_swap_highlights(refresh=False)
         self.cancel_capture()
         previous={key:value.get() for key,value in self.values.items()}
         self.fields=[(key,binding_label(key)) for key in schema.bindings]
@@ -542,6 +544,7 @@ class App:
         return self.store.get('version')!=3 or any(set(values)!=self.field_keys for values in self.store['presets'].values())
     def form_values(self): return validate({k: var.get() for k, var in self.values.items()})
     def fill(self, values, priorities=None):
+        self.clear_swap_highlights(refresh=False)
         self.cancel_capture()
         values = complete_bindings(values,self.schema.values()) if self.schema else validate(values)
         self.loading_bindings = True
@@ -832,6 +835,7 @@ class App:
         if not self.capture_state or self.capture_state['key'] != key:
             self.displays[key].set(self.values[key].get())
         if not self.loading_bindings:
+            self.clear_swap_highlight(key,refresh=False)
             self.edit_counter += 1
             self.edit_order[key] = self.edit_counter
             self.refresh_conflicts()
@@ -850,11 +854,41 @@ class App:
         self.conflict_fields = red
         for key,entry in self.binding_entries.items():
             listening = self.capture_state and self.capture_state['key']==key
-            background = '#493a17' if listening else '#3b181c' if key in red else '#211c13'
-            entry.configure(style='Listening.TEntry' if listening else 'Conflict.TEntry' if key in red else 'Binding.TEntry')
-            self.binding_labels[key].configure(style='Conflict.TLabel' if key in red else 'TLabel')
-            self.binding_frames[key].configure(bg=background,highlightbackground='#ffd100' if listening else '#d95160' if key in red else '#8e7135')
+            swapped = key in self.swap_timers
+            background = '#493a17' if listening else '#3b181c' if key in red else '#433712' if swapped else '#211c13'
+            entry.configure(style='Listening.TEntry' if listening else 'Conflict.TEntry' if key in red else 'Swapped.TEntry' if swapped else 'Binding.TEntry')
+            self.binding_labels[key].configure(style='Conflict.TLabel' if key in red else 'Swapped.TLabel' if swapped else 'TLabel')
+            self.binding_frames[key].configure(bg=background,highlightbackground='#ffd100' if listening else '#d95160' if key in red else '#e6bc42' if swapped else '#8e7135')
             self.clear_buttons[key].configure(bg=background)
+
+    def clear_swap_highlight(self,key,refresh=True):
+        timer = self.swap_timers.pop(key,None)
+        if timer is not None: self.root.after_cancel(timer)
+        if refresh: self.refresh_conflicts()
+
+    def clear_swap_highlights(self,refresh=True):
+        for key in list(self.swap_timers): self.clear_swap_highlight(key,refresh=False)
+        if refresh: self.refresh_conflicts()
+
+    def assign_binding(self,key,value):
+        value = canonical(value)
+        previous = self.values[key].get()
+        if value == previous: return
+        owners = [other for other,var in self.values.items() if other != key and value and var.get() == value]
+        owner = max(owners,key=lambda other:self.edit_order[other]) if owners else None
+        changed = [owner,key] if owner else [key]
+        for field in changed: self.clear_swap_highlight(field,refresh=False)
+        self.loading_bindings = True
+        try:
+            if owner: self.values[owner].set(previous)
+            self.values[key].set(value)
+        finally: self.loading_bindings = False
+        for field in changed:
+            self.edit_counter += 1
+            self.edit_order[field] = self.edit_counter
+        if owner:
+            self.swap_timers[owner] = self.root.after(3000,lambda:self.clear_swap_highlight(owner))
+        self.refresh_conflicts()
 
     def clear_binding(self,key):
         if self.busy: return 'break'
@@ -897,7 +931,7 @@ class App:
         except ValueError: return 'break'
         key = self.capture_state['key']
         self.cancel_capture()
-        self.values[key].set(value)
+        self.assign_binding(key,value)
         self.status.set('')
         return 'break'
 
