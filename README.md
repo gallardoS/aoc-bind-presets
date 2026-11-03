@@ -43,9 +43,3 @@ To run the tests:
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests
 ```
-
-## Automatic releases
-
-Every push to `main` runs the tests, builds the app, and publishes a new release with the `.exe`. Versions are numbered automatically: `v1.0.0`, `v1.0.1`, and so on.
-
-You can also start the **Release** workflow manually from **Actions**. If a check fails, no release is published.
