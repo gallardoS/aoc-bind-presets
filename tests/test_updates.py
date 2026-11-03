@@ -136,13 +136,18 @@ class UpdateTests(unittest.TestCase):
             app.busy=True
             controller=updates.UpdateController(app);controller.draft_restored=True
             controller.pending=(folder/'stage','1.0.10','digest')
+            (folder/'stage').mkdir()
             controller.idle=lambda:not app.busy
-            with patch.object(updates,'prepare_install') as prepare:
+            process=Mock();process.poll.return_value=None
+            with patch.object(updates,'prepare_install',return_value=process) as prepare:
                 controller.poll();prepare.assert_not_called();app.root.destroy.assert_not_called()
                 app.busy=False;controller.poll();prepare.assert_called_once()
             draft=json.loads((app.data/'update-draft.json').read_text())
             self.assertEqual(draft['bindings'],{'action_1':'Ctrl-KeyQ'})
             self.assertEqual(draft['name'],'Mage')
+            app.root.destroy.assert_not_called()
+            (folder/'stage'/'helper-ready.json').write_text(json.dumps({'owner':updates.OWNER}))
+            controller.finish_handoff()
             app.root.destroy.assert_called_once()
 
 

@@ -189,13 +189,18 @@ def write_result(target,ok,message):
     os.replace(temporary,data/'update-result.json')
 
 
-def install_update(manifest_path,wait=wait_for_exit,launch=launch_app,read_version=file_version):
+def read_install_manifest(manifest_path):
     manifest_path=Path(manifest_path).resolve();stage=manifest_path.parent
     manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
     target=Path(manifest['target']).resolve()
     if manifest.get('owner')!=OWNER or stage.parent!=target.parent or not stage.name.startswith('.aoc-update-') or manifest_path.name!='manifest.json':
         raise ValueError('Invalid update staging folder.')
     if not re.fullmatch(r'AoC-bind-presets(?: \(\d+\))?\.exe',target.name,re.I):raise ValueError('Unexpected update target.')
+    return manifest,stage,target
+
+
+def install_update(manifest_path,wait=wait_for_exit,launch=launch_app,read_version=file_version):
+    manifest,stage,target=read_install_manifest(manifest_path)
     candidate=stage/'candidate.exe';backup=stage/'previous.exe';replaced=False
     try:
         wait(manifest['pids'])
@@ -221,13 +226,14 @@ def install_update(manifest_path,wait=wait_for_exit,launch=launch_app,read_versi
         return False
 
 
-def prepare_install(target,stage,version,digest):
+def prepare_install(target,stage,version,digest,position=None):
     if not re.fullmatch(r'AoC-bind-presets(?: \(\d+\))?\.exe',target.name,re.I):
         raise ValueError('Keep the standard app filename to install updates automatically.')
     if stage.resolve().parent!=target.resolve().parent:
         raise ValueError('The app and update must be in the same folder.')
     manifest={'owner':OWNER,'target':str(target.resolve()),'version':version,'sha256':digest,
-              'original_sha256':file_hash(target),'pids':[os.getpid(),os.getppid()]}
+              'original_sha256':file_hash(target),'pids':[os.getpid(),os.getppid()],
+              'handoff':1,'position':position}
     (stage/'manifest.json').write_text(json.dumps(manifest),encoding='utf-8')
     helper=stage/'update-helper.exe';shutil.copy2(target,helper)
     return subprocess.Popen([str(helper),'--install-update',str(stage/'manifest.json')],cwd=str(stage),creationflags=subprocess.CREATE_NO_WINDOW,close_fds=True)
@@ -235,14 +241,18 @@ def prepare_install(target,stage,version,digest):
 
 def cleanup_stage(stage,base):
     stage=Path(stage).resolve();base=Path(base).resolve()
-    if stage.parent!=base or not stage.name.startswith('.aoc-update-'):return
+    if stage.parent!=base or not stage.name.startswith('.aoc-update-'):return True
     manifest=stage/'manifest.json'
     try:
-        if json.loads(manifest.read_text()).get('owner')!=OWNER:return
-        for name in ('candidate.exe','previous.exe','update-helper.exe','manifest.json'):
+        payload=json.loads(manifest.read_text())
+        if payload.get('owner')!=OWNER:return True
+        if payload.get('handoff') and not (stage/'helper-done.json').exists():return False
+        for name in ('candidate.exe','previous.exe','update-helper.exe','helper-ready.json','manager-ready.json','helper-done.json','cancel-update.json','manifest.json'):
             (stage/name).unlink(missing_ok=True)
         stage.rmdir()
-    except (OSError,ValueError):pass
+        return True
+    except FileNotFoundError:return not stage.exists()
+    except (OSError,ValueError):return False
 
 
 class UpdateController:
@@ -264,7 +274,7 @@ class UpdateController:
 
     def start(self,check=True,cleanup=None):
         self.record_status('checking' if check else 'check-disabled')
-        if cleanup:self.root.after(2500,lambda:cleanup_stage(cleanup,self.app.data.parent))
+        if cleanup:self.root.after(100,lambda:self.confirm_open(cleanup))
         self.root.after(150,self.restore_draft)
         if not check:return
         def worker():
@@ -287,6 +297,37 @@ class UpdateController:
                 self.results.put(('error',str(exc)))
         threading.Thread(target=worker,daemon=True).start()
         self.root.after(150,self.poll)
+
+    def confirm_open(self,stage):
+        if not self.root.winfo_viewable() or self.app.busy or not self.draft_restored:
+            self.root.after(100,lambda:self.confirm_open(stage));return
+        try:
+            manifest,folder,target=read_install_manifest(Path(stage)/'manifest.json')
+            if target.parent!=self.app.data.parent.resolve():return
+            if manifest.get('handoff'):
+                (folder/'manager-ready.json').write_text(json.dumps({'owner':OWNER}),encoding='utf-8')
+        except (OSError,ValueError,KeyError):return
+        self.root.after(2500,lambda:self.cleanup_update(stage))
+
+    def cleanup_update(self,stage,attempts=0):
+        if not cleanup_stage(stage,self.app.data.parent) and attempts<120:
+            self.root.after(500,lambda:self.cleanup_update(stage,attempts+1))
+
+    def finish_handoff(self):
+        stage,process,deadline=self.handoff
+        ready=stage/'helper-ready.json'
+        try:
+            if ready.exists() and json.loads(ready.read_text(encoding='utf-8')).get('owner')==OWNER:
+                self.root.destroy();return
+            if process.poll() is not None or time.monotonic()>deadline:
+                raise ValueError('The update window could not open. You can keep using the app.')
+        except (OSError,ValueError) as exc:
+            # Release any late-starting helper without closing the manager.
+            try:(stage/'cancel-update.json').write_text(json.dumps({'owner':OWNER}),encoding='utf-8')
+            except OSError:pass
+            (self.app.data/'update-draft.json').unlink(missing_ok=True)
+            self.app.busy=False;self.report_error(str(exc));return
+        self.root.after(50,self.finish_handoff)
 
     def record_status(self,phase,**details):
         try:
@@ -378,8 +419,11 @@ class UpdateController:
                 path=self.app.data/'update-draft.json';temporary=path.with_suffix('.tmp')
                 temporary.write_text(json.dumps(draft),encoding='utf-8');os.replace(temporary,path)
                 self.app.busy=True;self.app.status.set('Updating to v'+version+'… Restarting the app.')
-                prepare_install(Path(sys.executable),stage,version,digest)
-                self.root.destroy()
+                position=[self.dialog.winfo_x(),self.dialog.winfo_y()] if self.dialog is not None else None
+                if self.dialog is not None:self.update_detail.configure(text='Restarting the app…')
+                process=prepare_install(Path(sys.executable),stage,version,digest,position=position)
+                self.handoff=(stage,process,time.monotonic()+30)
+                self.root.after(50,self.finish_handoff)
                 return
             except Exception as exc:
                 (self.app.data/'update-draft.json').unlink(missing_ok=True)

@@ -965,8 +965,8 @@ if __name__ == '__main__':
     if len(sys.argv)==3 and sys.argv[1]=='--install-update':
         if not getattr(sys,'frozen',False):sys.exit(2)
         try:
-            from app_updates import install_update
-            sys.exit(0 if install_update(sys.argv[2]) else 1)
+            from update_installer import run_installer
+            sys.exit(0 if run_installer(sys.argv[2]) else 1)
         except Exception:sys.exit(1)
     try:
         if os.name == 'nt':
